@@ -59,6 +59,14 @@ try {
     assert.equal(await page.locator('#photo').evaluate(img => img.naturalWidth),2400);
     await page.locator('#home').click();
     if (!saveData) {
+      await page.locator('.card').nth(30).click();
+      await page.evaluate(() => { for (let index = 0; index < 12; index++) document.querySelector('#next').click(); });
+      await page.locator('#home').click();
+      await page.waitForFunction(() => !document.querySelector('#viewer').open && document.activeElement?.dataset.photoId === '42');
+      assert.equal(await page.locator('.card').nth(42).evaluate(card => {
+        const rect = card.getBoundingClientRect(); return rect.top >= -1 && rect.bottom <= innerHeight + 1;
+      }),true,'home returns to the last viewed photo after navigation, rather than the page top or initially opened photo');
+      await page.evaluate(() => scrollTo(0,0));
       for (const width of [320,390,820,1440]) {
         await page.setViewportSize({width,height:width === 1440 ? 1000 : 844});
         for (const period of ['day','week','month','year']) {
@@ -91,5 +99,5 @@ try {
     assert.deepEqual(errors,[]);
     await context.close();
   }
-  console.log('PASS 3-column grid at 320/390/820/1440px, every period, instant decoded-image reuse, progressive original, skipped-download cancellation, reduced motion, data saving, thumbnail fallback');
+  console.log('PASS home returns to the last viewed card after navigation, 3-column grid at 320/390/820/1440px, every period, instant decoded-image reuse, progressive original, skipped-download cancellation, reduced motion, data saving, thumbnail fallback');
 } finally { await browser.close(); }

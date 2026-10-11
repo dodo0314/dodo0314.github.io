@@ -445,6 +445,90 @@ test('original renewal rejects items removed from the album or an owner changed 
     const list = await (await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).json();
     const original = await worker.fetch(new Request(env.PUBLIC_ORIGIN+list.items[0].original+'?fresh=1&mode=bytes'),env);
     assert.equal(original.status,changeOwner ? 403 : 404);
-    assert.equal(scans,2);
+    assert.ok(scans >= 2 && scans <= 3,'removed items require only bounded collection checks');
+  }
+});
+
+test('expired thumbnail and preview links renew together through their recorded page without reading the whole album', async () => {
+  const env = {...environment(),MS_CLIENT_ID:'expired-preview-page'};
+  let pageReads = 0, bytes = 0;
+  globalThis.fetch = async (input,init) => {
+    const url = String(input);
+    if (url.includes('/oauth2/v2.0/token')) return Response.json({access_token:'preview-token',refresh_token:'preview-refresh',expires_in:3600});
+    if (url.endsWith('/owner-album')) return Response.json({id:'owner-album'});
+    if (url.includes('children')) {
+      assert.equal(url.includes('$orderby'),false,'a recorded collection page does not require a new album walk');
+      pageReads++;
+      return Response.json({value:[{id:'photo-one',name:'one.heic',file:{mimeType:'image/heic'},'@microsoft.graph.downloadUrl':'https://photos.example/original.heic',
+        thumbnails:[{medium:{url:`https://photos.example/${pageReads === 1 ? 'expired' : 'renewed'}-thumb.jpg`},large:{url:`https://photos.example/${pageReads === 1 ? 'expired' : 'renewed'}-preview.jpg`}}]}]});
+    }
+    assert.equal(url.startsWith('https://photos.example/'),true);
+    assert.equal(init.headers?.Authorization,undefined); assert.equal(init.headers?.Cookie,undefined);
+    bytes++;
+    return url.includes('/expired-') ? new Response(null,{status:401}) : new Response('valid-jpeg-bytes',{headers:{'Content-Type':'image/jpeg'}});
+  };
+  const data = await (await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).json();
+  assert.ok(data.items[0].thumbnail.startsWith('/api/preview/'));
+  assert.ok(data.items[0].preview.startsWith('/api/preview/'));
+  for (const path of [data.items[0].thumbnail,data.items[0].preview]) {
+    const response = await worker.fetch(new Request(env.PUBLIC_ORIGIN+path,{headers:{Cookie:'visitor-private'}}),env);
+    assert.equal(response.status,200); assert.equal(await response.text(),'valid-jpeg-bytes');
+    assert.equal(response.headers.get('Cache-Control'),'private, max-age=300');
+  }
+  assert.equal(pageReads,2); assert.equal(bytes,3);
+  assert.equal((await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/preview/forged'),env)).status,403);
+  assert.equal(bytes,3);
+});
+
+test('legacy snapshots seek newer filenames, fall back for unsupported ordering and stop after the matching page', async () => {
+  for (const ordered of [true,false]) {
+  const env = {...environment(),MS_CLIENT_ID:'legacy-preview-page-'+ordered};
+  let pageReads = 0;
+  globalThis.fetch = async input => {
+    const url = String(input);
+    if (url.includes('/oauth2/v2.0/token')) return Response.json({access_token:'seek-token',refresh_token:'seek-refresh',expires_in:3600});
+    if (url.endsWith('/owner-album')) return Response.json({id:'owner-album'});
+    if (url.includes('children')) {
+      pageReads++;
+      if (pageReads === 2) {
+        assert.ok(url.includes('$orderby=name%20desc'));
+        if (!ordered) return new Response(null,{status:400});
+      }
+      return Response.json({value:[{id:'photo-one',name:'20261010_104347967_iOS.heic',file:{mimeType:'image/heic'},thumbnails:[{large:{url:'https://photos.example/preview.jpg'}}]}],
+        ...(pageReads > 1 ? {'@odata.nextLink':'https://graph.microsoft.com/v1.0/me/drive/items/owner-album/children?unused=1'} : {})});
+    }
+    if (url==='https://photos.example/preview.jpg') return new Response('jpeg',{headers:{'Content-Type':'image/jpeg'}});
+    throw Error('Do not enumerate unrelated later pages');
+  };
+  const first = await (await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).json();
+  const oldEnv = {...env,GALLERY_KV:{...env.GALLERY_KV,async get(key,type) {
+    const value = await env.GALLERY_KV.get(key,type);
+    if (key.startsWith('album:') && type === 'json' && value) return {...value,updatedAt:new Date(Date.now()-6*3600000).toISOString(),items:value.items.map(({listingPath,...item})=>item)};
+    return value;
+  }}};
+  const image = await worker.fetch(new Request(env.PUBLIC_ORIGIN+first.items[0].preview),oldEnv);
+  assert.equal(image.status,200); assert.equal(await image.text(),'jpeg'); assert.equal(pageReads,ordered ? 2 : 3);
+  }
+});
+
+test('preview streaming rejects non-images, arbitrary redirects and capabilities outside the album scope', async () => {
+  for (const html of [false,true]) {
+    const env = {...environment(),MS_CLIENT_ID:'preview-rejection-'+html};
+    mockGraph(1); const upstream = globalThis.fetch; let downloads = 0;
+    globalThis.fetch = async (input,init) => {
+      const url = String(input);
+      if (url.startsWith('https://photos.example/')) {
+        downloads++;
+        return html ? new Response('<html>sign-in</html>',{headers:{'Content-Type':'text/html'}}) : new Response(null,{status:302,headers:{Location:'https://attacker.example/file'}});
+      }
+      assert.equal(url.includes('attacker.example'),false);
+      return upstream(input,init);
+    };
+    const list = await (await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).json();
+    assert.equal((await worker.fetch(new Request(env.PUBLIC_ORIGIN+list.items[0].thumbnail),env)).status,503);
+    assert.equal(downloads,1);
+    const wrong = await sign({kind:'media',id:'photo-one',scope:'different-album',connectionId:'legacy',exp:Date.now()+60000},env);
+    assert.equal((await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/preview/'+wrong),env)).status,403);
+    assert.equal(downloads,1);
   }
 });

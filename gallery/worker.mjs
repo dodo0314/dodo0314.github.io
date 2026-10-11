@@ -15,6 +15,7 @@ const albumStates = new WeakMap();
 const SNAPSHOT_VERSION = 3;
 const PAGE_SIZE = 60;
 const SNAPSHOT_REFRESH_MS = 15 * 60000;
+const BUILD_ID = '2026-10-12-images-v4';
 let signingKey;
 
 class AppError extends Error {
@@ -107,6 +108,7 @@ function response(body, status = 200, headers = {}) {
     'Content-Type': 'text/html; charset=utf-8',
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
+    'X-Gallery-Build': BUILD_ID,
     // Preserve Origin on same-origin form posts so the CSRF check can validate them.
     // Suppress referrers when navigating to Microsoft or loading external photos.
     'Referrer-Policy': 'same-origin',
@@ -210,6 +212,9 @@ function httpsUrl(value) {
 async function deliverOriginal(target, request, record) {
   if (new URL(request.url).searchParams.get('mode') !== 'bytes') return redirect(target);
   if (record?.kind !== 'photo') throw new AppError('이 항목은 사진 원본이 아닙니다.', 400);
+  return streamImage(target);
+}
+async function streamImage(target, preview = false) {
   // Only an authenticated Graph result / album snapshot supplies this URL.
   // Never forward the visitor's headers or the owner's Microsoft access token.
   const initial = new URL(target);
@@ -234,12 +239,15 @@ async function deliverOriginal(target, request, record) {
         error.originalStatus = remote.status;
         throw error;
       }
-      if (Number(remote.headers.get('Content-Length')) > 32 * 1024 * 1024) {
+      if (Number(remote.headers.get('Content-Length')) > (preview ? 8 : 32) * 1024 * 1024) {
         await remote.body?.cancel(); throw new AppError('이 사진은 브라우저 변환 용량을 초과합니다. 원본 열기를 사용해 주세요.', 413);
+      }
+      if (preview && !remote.headers.get('Content-Type')?.toLowerCase().startsWith('image/')) {
+        await remote.body?.cancel(); throw new AppError('미리보기 이미지 응답을 확인할 수 없습니다.');
       }
       return { response: response(remote.body, 200, {
         'Content-Type': remote.headers.get('Content-Type') || 'application/octet-stream',
-        'Cache-Control': 'private, no-store', 'Content-Disposition': 'inline',
+        'Cache-Control': preview ? 'private, max-age=300' : 'private, no-store', 'Content-Disposition': 'inline',
       }) };
     });
     if (result.next) { url = result.next; continue; }
@@ -287,7 +295,7 @@ export async function readAlbum(env, connection) {
       items.push({ id: item.id, name: item.name || '', kind, width: item.image?.width || item.video?.width || 0,
         height: item.image?.height || item.video?.height || 0, duration: Number(item.video?.duration) || 0,
         ...mediaDate(item), thumbnail: small, preview: large, source,
-        driveId: item.parentReference?.driveId || root.parentReference?.driveId || '', downloadUrl: original });
+        driveId: item.parentReference?.driveId || root.parentReference?.driveId || '', downloadUrl: original, listingPath: next });
     }
     next = data['@odata.nextLink'] || null;
   }
@@ -329,20 +337,88 @@ async function album(env, force = false, ctx) {
     return promise;
   }
 }
-async function renewOriginalFromAlbum(env, snapshot, id) {
-  // Migrated albums can list their children while rejecting direct item lookups.
-  // Reuse a renewal completed by another request, or coalesce one full refresh.
-  const current = await album(env);
-  const renewed = current.revision !== snapshot.revision ? current : await album(env, true);
+function mediaLinks(item, listingPath) {
+  const thumbs = item.thumbnails?.[0] || {};
+  return { id:item.id, downloadUrl:httpsUrl(item['@microsoft.graph.downloadUrl']),
+    thumbnail:httpsUrl(thumbs.medium?.url || thumbs.small?.url || thumbs.large?.url),
+    preview:httpsUrl(thumbs.large?.url || thumbs.medium?.url || thumbs.small?.url), listingPath };
+}
+async function checkLinkOwner(env, snapshot) {
   const connection = await readConnection(env, 'json');
-  if (!connection?.refreshToken || connectionId(connection) !== snapshot.connectionId || renewed.key !== snapshot.key || renewed.connectionId !== snapshot.connectionId) {
+  if (!connection?.refreshToken || connectionId(connection) !== snapshot.connectionId || await albumKey(env) !== snapshot.key) {
     throw new AppError('이 사진·영상 링크가 만료되었습니다.', 403);
   }
-  const item = renewed.items.find(item => item.id === id);
-  if (!item) throw new AppError('이 순간은 현재 앨범에 없습니다.', 404);
-  const target = httpsUrl(item.downloadUrl);
-  if (!target) throw new AppError('이 사진·영상의 원본 링크를 받지 못했습니다. 잠시 후 다시 시도해 주세요.');
-  return target;
+}
+function linksState(env, snapshot) {
+  const state = albumState(env), scope = snapshot.key + ':' + snapshot.connectionId;
+  if (state.links?.scope !== scope || state.links.revision !== snapshot.revision || Date.now() - state.links.startedAt >= SNAPSHOT_REFRESH_MS) {
+    state.links = {scope,revision:snapshot.revision,startedAt:Date.now(),records:new Map(),allowed:new Set(snapshot.items.map(item => item.id)),pages:new Map(),next:null,initialized:false,count:0};
+  }
+  return state.links;
+}
+async function renewLinks(env, snapshot, record, force = false) {
+  await checkLinkOwner(env, snapshot);
+  const state = linksState(env, snapshot);
+  const hint = record.listingPath || state.records.get(record.id)?.listingPath;
+  if (force) {
+    const previous = state.records.get(record.id);
+    if (previous && state.pages.get(previous.listingPath)?.settled) state.pages.delete(previous.listingPath);
+    state.records.delete(record.id);
+  }
+  if (state.records.has(record.id)) return state.records.get(record.id);
+  const readPage = path => {
+    if (!state.pages.has(path)) {
+      const pending = (async () => {
+        const data = await graph(path, env);
+        if (!Array.isArray(data?.value)) throw new AppError('앨범 미리보기 목록을 확인할 수 없습니다.');
+        await checkLinkOwner(env, snapshot);
+        for (const item of data.value) if (isMedia(item) && state.allowed.has(item.id)) {
+          state.records.set(item.id, mediaLinks(item, path));
+        }
+        return data['@odata.nextLink'] || null;
+      })();
+      const entry = {pending,settled:false}; state.pages.set(path, entry);
+      pending.then(() => { entry.settled = true; }, () => { if (state.pages.get(path) === entry) state.pages.delete(path); });
+    }
+    return state.pages.get(path).pending;
+  };
+  // Synchronization records the exact collection page for each item. Subsequent
+  // renewals read that page, instead of walking all 2,000+ album entries again.
+  if (hint) {
+    if (force && state.pages.get(hint)?.settled) state.pages.delete(hint);
+    try { await readPage(hint); }
+    catch (error) { if (![400,404].includes(error.upstreamStatus)) throw error; }
+    if (state.records.has(record.id)) return state.records.get(record.id);
+  }
+  // Old snapshots lack page hints. Try newest filenames first; unsupported
+  // ordering falls back to the album's normal collection, still stopping early.
+  while (!state.records.has(record.id)) {
+    if (!state.walking) {
+      const pending = (async () => {
+        if (!state.initialized) {
+          const root = await getRoot(env);
+          state.base = `/me/drive/items/${encodeURIComponent(root.id)}/children?$expand=thumbnails&$top=200`;
+          state.next = state.base + '&$orderby=name%20desc'; state.initialized = true;
+        }
+        if (!state.next) throw new AppError('이 순간은 현재 앨범에 없습니다.', 404);
+        if (++state.count > 40) throw new AppError('앨범 링크 조회가 너무 오래 걸립니다. 관리자 화면에서 목록을 새로고침해 주세요.');
+        const path = state.next;
+        try { state.next = await readPage(path); }
+        catch (error) {
+          if (state.count !== 1 || ![400,404].includes(error.upstreamStatus)) throw error;
+          try { state.next = await readPage(state.base); }
+          catch (fallback) {
+            if (![400,404].includes(fallback.upstreamStatus)) throw fallback;
+            state.next = await readPage(`/shares/${shareToken(env)}/driveItem/children?$expand=thumbnails&$top=200`);
+          }
+        }
+      })();
+      state.walking = pending;
+      pending.finally(() => { if (state.walking === pending) state.walking = null; }).catch(() => {});
+    }
+    await state.walking;
+  }
+  return state.records.get(record.id);
 }
 export async function albumPage(snapshot, env, search, favoriteIds) {
   const order = ['new', 'old', 'album', 'uploaded'].includes(search.get('sort')) ? search.get('sort') : 'new';
@@ -362,7 +438,8 @@ export async function albumPage(snapshot, env, search, favoriteIds) {
     const capability = await sign({ kind: 'media', id: item.id, scope: snapshot.key, connectionId: snapshot.connectionId, exp: Date.now() + 60 * 60000 }, env);
     return { id: item.id, name: item.name, kind: item.kind, width: item.width, height: item.height, duration: item.duration,
       date: item.date, dateSource: item.dateSource, uploadedAt: item.uploadedAt,
-      thumbnail: item.thumbnail, preview: item.preview, original: '/api/original/' + capability };
+      thumbnail: '/api/preview/' + capability + '?size=thumb', preview: '/api/preview/' + capability,
+      original: '/api/original/' + capability };
   }));
   return { title: snapshot.title, total: snapshot.items.length, counts: snapshot.counts, matched: ordered.length,
     items, offset, focusIndex: focusPosition >= 0 ? focusPosition - offset : null,
@@ -411,9 +488,11 @@ export default {
         data.items[0].original += '?fresh=1';
         return json(data.items[0]);
       }
-      if (url.pathname.startsWith('/api/original/') && request.method === 'GET') {
+      if ((url.pathname.startsWith('/api/original/') || url.pathname.startsWith('/api/preview/')) && request.method === 'GET') {
         requireConfig(env);
-        const capability = url.pathname.slice('/api/original/'.length);
+        const isPreview = url.pathname.startsWith('/api/preview/');
+        if (isPreview && url.searchParams.has('size') && url.searchParams.get('size') !== 'thumb') throw new AppError('미리보기 크기를 확인해 주세요.', 400);
+        const capability = url.pathname.slice(isPreview ? '/api/preview/'.length : '/api/original/'.length);
         const media = await verify(capability, env, 'media');
         const photo = media || await verify(capability, env, 'photo');
         if (!photo || typeof photo.id !== 'string') throw new AppError('사진 링크가 만료되었습니다. 갤러리를 새로고침해 주세요.', 403);
@@ -425,32 +504,34 @@ export default {
           const record = snapshot.items.find(item => item.id === media.id);
           if (!record) throw new AppError('이 순간은 현재 앨범에 없습니다.', 404);
           const snapshotAge = Date.now() - Date.parse(snapshot.updatedAt);
-          // Recently synchronized OneDrive download links can start playback
-          // immediately. A retry explicitly requests a fresh item lookup.
-          if (url.searchParams.get('fresh') !== '1' && snapshotAge >= 0 && snapshotAge < SNAPSHOT_REFRESH_MS && httpsUrl(record.downloadUrl)) {
-            try { return await deliverOriginal(httpsUrl(record.downloadUrl), request, record); }
-            catch (error) { if (![401,403,404,410].includes(error.originalStatus)) throw error; }
-          }
-          const path = record.driveId ? `/drives/${encodeURIComponent(record.driveId)}/items/${encodeURIComponent(record.id)}` : record.source === 'share'
-            ? `/shares/${shareToken(env)}/items/${encodeURIComponent(record.id)}` : `/me/drive/items/${encodeURIComponent(record.id)}`;
-          let target;
-          try {
-            const item = await graph(path, env);
-            if (isMedia(item)) target = httpsUrl(item['@microsoft.graph.downloadUrl']);
-          } catch (error) {
-            if (![400, 403, 404].includes(error.upstreamStatus)) throw error;
-          }
-          let renewed = false;
-          if (!target) { target = await renewOriginalFromAlbum(env, snapshot, record.id); renewed = true; }
-          try { return await deliverOriginal(target, request, record); }
+          const targetOf = links => isPreview ? url.searchParams.get('size') === 'thumb' ? links.thumbnail || links.preview : links.preview || links.thumbnail : links.downloadUrl;
+          const resolve = async (force = false) => {
+            const cached = linksState(env,snapshot).records.get(record.id);
+            if (!force && targetOf(cached || {})) return targetOf(cached);
+            if (!force && url.searchParams.get('fresh') !== '1' && snapshotAge >= 0 && snapshotAge < SNAPSHOT_REFRESH_MS && targetOf(record)) return targetOf(record);
+            if (!isPreview) {
+              const path = record.driveId ? `/drives/${encodeURIComponent(record.driveId)}/items/${encodeURIComponent(record.id)}` : record.source === 'share'
+                ? `/shares/${shareToken(env)}/items/${encodeURIComponent(record.id)}` : `/me/drive/items/${encodeURIComponent(record.id)}`;
+              try {
+                const item = await graph(path, env);
+                if (isMedia(item) && targetOf(mediaLinks(item))) return targetOf(mediaLinks(item));
+              } catch (error) { if (![400,403,404].includes(error.upstreamStatus)) throw error; }
+            }
+            const links = await renewLinks(env,snapshot,record,force);
+            const target = targetOf(links);
+            if (!target) throw new AppError(isPreview ? '이 사진·영상의 미리보기를 받지 못했습니다.' : '이 사진·영상의 원본 링크를 받지 못했습니다.', 404);
+            return target;
+          };
+          const deliver = target => isPreview ? streamImage(target,true) : deliverOriginal(target,request,record);
+          try { return await deliver(await resolve()); }
           catch (error) {
-            if (renewed || ![401,403,404,410].includes(error.originalStatus)) throw error;
-            return await deliverOriginal(await renewOriginalFromAlbum(env, snapshot, record.id), request, record);
+            if (![401,403,404,410].includes(error.originalStatus)) throw error;
+            return await deliver(await resolve(true));
           }
         }
         // Some migrated albums do not expose direct child-item metadata paths.
         // The album listing already supplied a short-lived download URL for this specific photo.
-        if (url.searchParams.get('mode') === 'bytes') throw new AppError('사진 링크를 갱신해 주세요.', 403);
+        if (isPreview || url.searchParams.get('mode') === 'bytes') throw new AppError('사진 링크를 갱신해 주세요.', 403);
         if (photo.source === 'share' && httpsUrl(photo.url)) return redirect(httpsUrl(photo.url));
         const path = photo.source === 'share' ? `/shares/${shareToken(env)}/items/${encodeURIComponent(photo.id)}` : `/me/drive/items/${encodeURIComponent(photo.id)}`;
         const item = await graph(path, env);

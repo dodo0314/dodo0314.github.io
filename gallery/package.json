@@ -1,0 +1,10 @@
+{
+  "name": "jian-gallery",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node tests/run.mjs",
+    "check": "node --check worker.mjs && node --check media.mjs && node --check public/gallery.js && node --check public/period.mjs && node --check public/heic-viewer-worker.mjs"
+  }
+}

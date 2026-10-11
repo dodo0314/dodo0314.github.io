@@ -1,0 +1,13 @@
+{
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  "name": "jian",
+  "main": "dist/worker.mjs",
+  "compatibility_date": "2026-10-11",
+  "workers_dev": true,
+  "vars": {
+    "PUBLIC_ORIGIN": "https://jian.jahab.workers.dev",
+    "ALBUM_TITLE": "지안의 순간들",
+    "ALBUM_ITEM_ID": "D37406022CBD6DFA!s6b816f233fc9405282fc6a0143fe0687",
+    "ALBUM_SHARE_URL": "https://1drv.ms/a/c/d37406022cbd6dfa/IgAjb4FryT9SQIL8agFD_gaHAYrLN7LPVKSv0FA72S1P7bE"
+  }
+}

@@ -9,6 +9,29 @@
   let favorites = new Set(), lastViewed = '';
   let previewLoad, originalLoad, originalReady = false, zoomRequested = false;
   const originalCache = new Map();
+  const previewCache = new Map();
+  const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+  const saveData = navigator.connection?.saveData;
+  function rememberPreview(id, element) {
+    if (!element.complete || !element.naturalWidth) return;
+    previewCache.delete(id); previewCache.set(id, {element, savedAt:Date.now()});
+    if (previewCache.size > 12) previewCache.delete(previewCache.keys().next().value);
+  }
+  function readyPreview(id) {
+    const cached = previewCache.get(id);
+    if (cached && Date.now() - cached.savedAt < 5 * 60000) return cached.element;
+    previewCache.delete(id);
+    const element = [...document.querySelectorAll('.card')].find(card => card.dataset.photoId === id)?.querySelector('img');
+    return element?.complete && element.naturalWidth ? element : null;
+  }
+  function warmNeighbors(index) {
+    if (saveData || document.hidden) return;
+    for (const neighbor of [visible[index - 1], visible[index + 1]]) {
+      if (!neighbor || neighbor.kind === 'video' || !neighbor.preview || readyPreview(neighbor.id)) continue;
+      const warm = new Image(); warm.decoding = 'async'; warm.fetchPriority = 'low';
+      warm.onload = () => rememberPreview(neighbor.id, warm); warm.src = neighbor.preview;
+    }
+  }
   const heicCache = new Map(), temporaryURLs = new Set();
   let conversionController, conversionWorker, conversionTimer;
   const photoTimers = new Set();
@@ -43,7 +66,11 @@
   const duration = milliseconds => { const seconds = Math.floor((milliseconds || 0) / 1000); return seconds ? Math.floor(seconds / 60) + ':' + String(seconds % 60).padStart(2, '0') : '영상'; };
   function state(title, detail, loading = false) {
     const box = $('status'); box.replaceChildren(); box.hidden = false;
-    if (loading) { const spinner = document.createElement('span'); spinner.className = 'loader'; box.append(spinner); }
+    if (loading) {
+      const skeleton = document.createElement('div'); skeleton.className = 'skeleton-grid'; skeleton.setAttribute('aria-hidden','true');
+      for (let index = 0; index < 9; index++) skeleton.append(document.createElement('span'));
+      box.append(skeleton);
+    }
     const heading = document.createElement('h2'); heading.textContent = title;
     const text = document.createElement('p'); text.textContent = detail; box.append(heading, text);
   }
@@ -52,17 +79,22 @@
     button.setAttribute('aria-label', day(displayDate(item)) + ', ' + item.name + (item.kind === 'video' ? ', 영상 보기' : ', 크게 보기'));
     if (item.thumbnail || item.kind !== 'video') {
       const thumbnail = document.createElement('img');
-      thumbnail.alt = ''; thumbnail.loading = index < 6 ? 'eager' : 'lazy'; thumbnail.decoding = 'async';
-      if (index < 4) thumbnail.fetchPriority = 'high';
-      thumbnail.onload = () => stopThumbnailTimer(thumbnail);
+      thumbnail.alt = ''; thumbnail.loading = index < 9 ? 'eager' : 'lazy'; thumbnail.decoding = 'async';
+      if (index < 3) thumbnail.fetchPriority = 'high';
+      thumbnail.onload = () => { stopThumbnailTimer(thumbnail); if (!saveData) rememberPreview(item.id,thumbnail); };
       thumbnail.onerror = () => {
         stopThumbnailTimer(thumbnail);
+        if (item.thumbnail && thumbnail.src !== new URL(item.thumbnail,location.href).href) {
+          thumbnailWaiters.set(thumbnail,{}); thumbnail.src = item.thumbnail;
+          if (thumbnailObserver) thumbnailObserver.observe(thumbnail); else startThumbnailTimer(thumbnail);
+          return;
+        }
         thumbnail.onload = thumbnail.onerror = null; thumbnail.removeAttribute('src');
         thumbnail.remove();
         const error = document.createElement('span'); error.className = 'card-error'; error.textContent = item.kind === 'video' ? '영상 보기' : '사진 열기'; button.prepend(error);
       };
       if (item.thumbnail) {
-        thumbnailWaiters.set(thumbnail,{}); thumbnail.src = item.thumbnail; button.append(thumbnail);
+        thumbnailWaiters.set(thumbnail,{}); thumbnail.src = saveData ? item.thumbnail : item.preview || item.thumbnail; button.append(thumbnail);
         if (thumbnailObserver) thumbnailObserver.observe(thumbnail); else startThumbnailTimer(thumbnail);
       }
       else thumbnail.onerror();
@@ -101,13 +133,13 @@
         section.lastElementChild.append(card(item, (append ? start : 0) + relativeIndex));
       });
     }
-    $('list-info').hidden = !page;
+    $('list-info').hidden = !page || (!onlyFavorites && $('media-type').value === 'all');
     if (page) $('list-info').textContent = '사진 ' + page.counts.photo.toLocaleString() + '장 · 영상 ' + page.counts.video.toLocaleString() + '개' + (onlyFavorites || $('media-type').value !== 'all' ? ' · 선택한 목록 ' + page.matched.toLocaleString() + '개' : '');
     $('more-area').hidden = page?.nextOffset == null;
     $('more').disabled = paging;
     $('more-state').textContent = paging ? '다음 순간들을 불러오는 중…' : '';
   }
-  function cacheKey() { return 'jian-page-v4:' + $('sort').value + ':' + $('media-type').value + ':' + (onlyFavorites ? [...favorites].sort().join(',') : 'all'); }
+  function cacheKey() { return 'jian-page-v5:' + $('sort').value + ':' + $('media-type').value + ':' + (onlyFavorites ? [...favorites].sort().join(',') : 'all'); }
   function cachedPage() {
     try { const cached = JSON.parse(sessionStorage.getItem(cacheKey()) || 'null'); return cached && Date.now() - cached.savedAt < 5 * 60000 ? cached.data : null; } catch { return null; }
   }
@@ -277,75 +309,86 @@
       } else quality(originalFailed ? originalFailureText : isHeic(item) ? '미리보기 · HEIC 원본 준비 중…' : '미리보기 · 원본 화질 불러오는 중…', 'preview');
       if (!displayed) {
         displayed = true; schedule();
-        for (const neighbor of [visible[index - 1], visible[index + 1]]) if (neighbor?.kind !== 'video' && neighbor?.preview) { const warm = new Image(); warm.src = neighbor.preview; }
+        warmNeighbors(index);
+        if (!reducedMotion.matches) image.animate([{opacity:.75,transform:'scale(.97)'},{opacity:1,transform:'scale(1)'}], {duration:200,easing:'cubic-bezier(.2,.7,.2,1)'});
         if (index >= visible.length - 3 && page.nextOffset != null) more();
       }
     }
     function failure() {
       if (!active()) return;
-      if (displayed) { quality(originalFailureText, 'preview'); return; }
+      if (displayed) { if (originalFailed) quality(originalFailureText, 'preview'); return; }
       if (previewFailed && originalFailed) {
         $('photo-loading').hidden = true; $('photo-error').hidden = false; quality('', 'error');
         $('media-error-text').textContent = originalFailureText.replace(/^미리보기 · /,'') + '. 다시 시도하거나 원본 열기로 확인해 주세요.'; stop();
       }
     }
+    const ready = readyPreview(item.id);
+    if (ready) display(ready.currentSrc || ready.src, false);
     const previewURL = item.preview || item.thumbnail;
-    if (previewURL) {
+    if (previewURL && (!ready || ready.src !== new URL(previewURL,location.href).href)) {
       const preview = previewLoad = new Image(); preview.decoding = 'async';
-      preview.onload = () => display(preview.src, false);
+      preview.onload = () => { rememberPreview(item.id,preview); display(preview.src, false); };
       preview.onerror = () => { previewFailed = true; failure(); }; timedPhoto(preview,previewURL,12000);
-    } else previewFailed = true;
-    const full = originalLoad = new Image(); full.decoding = 'async'; full.fetchPriority = 'high';
-    if (isHeic(item)) {
-      const cached = heicCache.get(item.id);
-      if (cached) { full.onload = () => display(full.src, true, cached.converted); full.src = cached.url; return; }
-      const control = conversionController = new AbortController();
-      conversionTimer = setTimeout(() => control.abort(), 60000);
-      (async () => {
-        let phase = 'download';
-        try {
-          let blob;
-          try { blob = await downloadHeic(item.original, control.signal); }
-          catch (error) {
-            if (!active() || control.signal.aborted || error.message === 'too-large') throw error;
-            blob = await downloadHeic(await freshOriginal(item.id), control.signal);
-          }
-          if (!active()) return;
-          const nativeURL = URL.createObjectURL(blob); temporaryURLs.add(nativeURL);
-          const supported = await new Promise(resolve => { full.onload = () => resolve(true); full.onerror = () => resolve(false); control.signal.addEventListener('abort', () => resolve(false), {once:true}); full.src = nativeURL; });
-          if (!active()) return;
-          if (control.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
-          if (supported) { rememberHeic(item.id, nativeURL, blob.size, false); display(nativeURL, true); return; }
-          URL.revokeObjectURL(nativeURL); temporaryURLs.delete(nativeURL);
-          phase = 'conversion'; quality(displayed ? '미리보기 · HEIC 원본 변환 중…' : 'HEIC 원본 변환 중…', 'loading');
-          const result = await convertHeic(blob, control.signal);
-          if (!active()) return;
-          const convertedURL = URL.createObjectURL(result.blob); temporaryURLs.add(convertedURL);
-          full.onload = () => { if (active()) { rememberHeic(item.id, convertedURL, result.blob.size, result.converted); display(convertedURL, true, result.converted); } };
-          full.onerror = () => { if (active()) { originalFailed = true; originalFailureText = '미리보기 · HEIC 변환을 완료하지 못했어요'; failure(); } };
-          full.src = convertedURL;
-        } catch (error) {
-          if (!active()) return;
-          originalFailed = true; zoomRequested = false;
-          originalFailureText = error.message === 'too-large' ? '미리보기 · 큰 원본은 원본 열기로 확인해 주세요' : control.signal.aborted ? '미리보기 · 원본 준비 시간이 초과됐어요' : phase === 'download' ? '미리보기 · 원본 다운로드에 실패했어요' : '미리보기 · HEIC 변환을 완료하지 못했어요';
-          failure();
-        } finally { if (conversionController === control) { clearTimeout(conversionTimer); conversionController = null; } }
-      })();
-      return;
-    }
-    let retried = false;
-    full.onload = () => display(full.src, true);
-    full.onerror = async () => {
+    } else if (!previewURL && !ready) previewFailed = true;
+    const loadOriginal = () => {
       if (!active()) return;
-      if (!retried) {
-        retried = true;
-        try { const url = await freshOriginal(item.id); if (active()) { timedPhoto(full,url); return; } } catch {}
+      const full = originalLoad = new Image(); full.decoding = 'async'; full.fetchPriority = 'high';
+      if (isHeic(item)) {
+        const cached = heicCache.get(item.id);
+        if (cached) { full.onload = () => display(full.src, true, cached.converted); full.src = cached.url; return; }
+        const control = conversionController = new AbortController();
+        conversionTimer = setTimeout(() => control.abort(), 60000);
+        (async () => {
+          let phase = 'download';
+          try {
+            let blob;
+            try { blob = await downloadHeic(item.original, control.signal); }
+            catch (error) {
+              if (!active() || control.signal.aborted || error.message === 'too-large') throw error;
+              blob = await downloadHeic(await freshOriginal(item.id), control.signal);
+            }
+            if (!active()) return;
+            const nativeURL = URL.createObjectURL(blob); temporaryURLs.add(nativeURL);
+            const supported = await new Promise(resolve => { full.onload = () => resolve(true); full.onerror = () => resolve(false); control.signal.addEventListener('abort', () => resolve(false), {once:true}); full.src = nativeURL; });
+            if (!active()) return;
+            if (control.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+            if (supported) { rememberHeic(item.id, nativeURL, blob.size, false); display(nativeURL, true); return; }
+            URL.revokeObjectURL(nativeURL); temporaryURLs.delete(nativeURL);
+            phase = 'conversion'; quality(displayed ? '미리보기 · HEIC 원본 변환 중…' : 'HEIC 원본 변환 중…', 'loading');
+            const result = await convertHeic(blob, control.signal);
+            if (!active()) return;
+            const convertedURL = URL.createObjectURL(result.blob); temporaryURLs.add(convertedURL);
+            full.onload = () => { if (active()) { rememberHeic(item.id, convertedURL, result.blob.size, result.converted); display(convertedURL, true, result.converted); } };
+            full.onerror = () => { if (active()) { originalFailed = true; originalFailureText = '미리보기 · HEIC 변환을 완료하지 못했어요'; failure(); } };
+            full.src = convertedURL;
+          } catch (error) {
+            if (!active()) return;
+            originalFailed = true; zoomRequested = false;
+            originalFailureText = error.message === 'too-large' ? '미리보기 · 큰 원본은 원본 열기로 확인해 주세요' : control.signal.aborted ? '미리보기 · 원본 준비 시간이 초과됐어요' : phase === 'download' ? '미리보기 · 원본 다운로드에 실패했어요' : '미리보기 · HEIC 변환을 완료하지 못했어요';
+            failure();
+          } finally { if (conversionController === control) { clearTimeout(conversionTimer); conversionController = null; } }
+        })();
+        return;
       }
-      if (!active()) return;
-      originalFailed = true; zoomRequested = false; failure();
+      let retried = false;
+      full.onload = () => display(full.src, true);
+      full.onerror = async () => {
+        if (!active()) return;
+        if (!retried) {
+          retried = true;
+          try { const url = await freshOriginal(item.id); if (active()) { timedPhoto(full,url); return; } } catch {}
+        }
+        if (!active()) return;
+        originalFailed = true; zoomRequested = false; failure();
+      };
+      const cached = originalCache.get(item.id);
+      timedPhoto(full,cached && Date.now() - cached.savedAt < 30 * 60000 ? cached.url : item.original);
     };
-    const cached = originalCache.get(item.id);
-    timedPhoto(full,cached && Date.now() - cached.savedAt < 30 * 60000 ? cached.url : item.original);
+    // Wait for the opening gesture to settle so swiping past a photo never starts its HEIC download.
+    if (heicCache.has(item.id) || originalCache.has(item.id)) loadOriginal();
+    else {
+      const delay = setTimeout(() => { photoTimers.delete(delay); loadOriginal(); },350); photoTimers.add(delay);
+    }
   }
   function open(id, source) { const index = visible.findIndex(item => item.id === id); if (index < 0) return; lastFocused = source || document.activeElement; viewer.showModal(); show(index); }
   async function advance(direction, manual = true) {

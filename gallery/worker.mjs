@@ -15,7 +15,7 @@ const albumStates = new WeakMap();
 const SNAPSHOT_VERSION = 3;
 const PAGE_SIZE = 60;
 const SNAPSHOT_REFRESH_MS = 15 * 60000;
-const BUILD_ID = '2026-10-12-images-v4';
+const BUILD_ID = '2026-10-12-profile-v5';
 let signingKey;
 
 class AppError extends Error {

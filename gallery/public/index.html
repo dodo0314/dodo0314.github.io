@@ -11,9 +11,9 @@
 <body>
   <header class="header"><a class="brand" href="/" aria-label="갤러리 처음으로">jian<span class="brand-dot">.</span></a><button id="theme" class="theme-button" aria-label="어두운 화면으로 전환" aria-pressed="false" title="화면 색상 바꾸기">◐</button></header>
   <main>
-    <section class="intro"><div class="intro-title"><span class="eyebrow">OUR LITTLE ARCHIVE</span><h1 id="title">지안의 순간들</h1><p>함께 보고 싶은 순간들을 모았어요.</p></div><dl class="archive-summary" aria-label="앨범 전체 항목 수"><div><dt>사진</dt><dd id="photo-count">—</dd></div><div><dt>영상</dt><dd id="video-count">—</dd></div></dl></section>
+    <section class="intro" aria-label="앨범 프로필"><div class="profile-avatar" aria-hidden="true">j<span>.</span></div><div class="profile-details"><h1 id="title">지안의 순간들</h1><dl class="archive-summary" aria-label="앨범 전체 항목 수"><div><dt>사진</dt><dd id="photo-count">—</dd></div><div><dt>영상</dt><dd id="video-count">—</dd></div></dl></div></section>
     <div class="toolbar" aria-label="사진과 영상 보기 설정">
-      <div class="tabs"><button id="all" class="tab active" aria-pressed="true">모든 순간 <span id="total"></span></button><button id="favorite" class="tab" aria-pressed="false">♡ 좋아한 순간 <span id="fav-count"></span></button></div>
+      <div class="tabs"><button id="all" class="tab active" aria-pressed="true"><span class="tab-symbol" aria-hidden="true">▦</span> 모든 순간 <span id="total"></span></button><button id="favorite" class="tab" aria-pressed="false">♡ 좋아한 순간 <span id="fav-count"></span></button></div>
       <div class="tools"><label class="sr-only" for="media-type">종류</label><select id="media-type"><option value="all">사진 + 영상</option><option value="photo">사진만</option><option value="video">영상만</option></select><label class="sr-only" for="sort">정렬</label><select id="sort"><option value="new">촬영일 최신순</option><option value="old">촬영일 오래된순</option><option value="uploaded">업로드 최신순</option><option value="album">앨범 순서대로</option></select><div class="period-picker"><label for="period">기간</label><select id="period"><option value="day">일</option><option value="week">주</option><option value="month">월</option><option value="year">년</option></select></div><button id="refresh" class="icon-button" aria-label="목록 새로고침" title="새로고침">↻</button></div>
     </div>
     <div id="status" class="status" role="status"><span class="loader"></span><h2>순간들을 불러오는 중이에요</h2><p>잠시만 기다려 주세요.</p></div>

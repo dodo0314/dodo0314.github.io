@@ -57,7 +57,7 @@ try {
     await page.waitForFunction(() => document.querySelector('#photo').dataset.quality === 'original');
     assert.deepEqual(originals,['/original/1'],'rapidly skipped photos must not start an original download');
     assert.equal(await page.locator('#photo').evaluate(img => img.naturalWidth),2400);
-    await page.locator('#close').click();
+    await page.locator('#home').click();
     if (!saveData) {
       for (const width of [320,390,820,1440]) {
         await page.setViewportSize({width,height:width === 1440 ? 1000 : 844});
@@ -77,7 +77,7 @@ try {
       await page.emulateMedia({reducedMotion:'reduce'});
       await page.locator('.card').nth(4).click();
       assert.equal(await page.locator('#photo').evaluate(img => img.getAnimations().length),0);
-      await page.locator('#close').click();
+      await page.locator('#home').click();
       failLarge = true;
       await page.locator('#refresh').click();
       await page.waitForFunction(() => document.querySelector('.card img')?.naturalWidth === 176);

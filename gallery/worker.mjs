@@ -15,7 +15,7 @@ const albumStates = new WeakMap();
 const SNAPSHOT_VERSION = 3;
 const PAGE_SIZE = 60;
 const SNAPSHOT_REFRESH_MS = 15 * 60000;
-const BUILD_ID = '2026-10-12-profile-v5';
+const BUILD_ID = '2026-10-12-loading-v6';
 let signingKey;
 
 class AppError extends Error {
@@ -352,14 +352,40 @@ async function checkLinkOwner(env, snapshot) {
 function linksState(env, snapshot) {
   const state = albumState(env), scope = snapshot.key + ':' + snapshot.connectionId;
   if (state.links?.scope !== scope || state.links.revision !== snapshot.revision || Date.now() - state.links.startedAt >= SNAPSHOT_REFRESH_MS) {
-    state.links = {scope,revision:snapshot.revision,startedAt:Date.now(),records:new Map(),allowed:new Set(snapshot.items.map(item => item.id)),pages:new Map(),next:null,initialized:false,count:0};
+    state.links = {scope,revision:snapshot.revision,startedAt:Date.now(),records:new Map(),allowed:new Set(snapshot.items.map(item => item.id)),pages:new Map(),hints:new Map(),hintPages:new Map(),next:null,initialized:false,count:0};
   }
   return state.links;
 }
 async function renewLinks(env, snapshot, record, force = false) {
   await checkLinkOwner(env, snapshot);
   const state = linksState(env, snapshot);
-  const hint = record.listingPath || state.records.get(record.id)?.listingPath;
+  // Persist only page locations, never file bytes or short-lived download URLs.
+  // Legacy snapshots otherwise walk the entire album again on every cold Worker.
+  const hintKey = 'page-hints:' + state.scope + ':' + snapshot.revision;
+  if (!record.listingPath && !state.hintsLoaded) {
+    state.hintsLoaded = (async () => {
+      const saved = await env.GALLERY_KV.get(hintKey,'json');
+      if (saved?.scope !== state.scope || saved.revision !== snapshot.revision || !Array.isArray(saved.pages)) return;
+      for (const page of saved.pages) if (typeof page.path === 'string' && Array.isArray(page.ids)) {
+        const ids = page.ids.filter(id => state.allowed.has(id));
+        state.hintPages.set(page.path,ids);
+        for (const id of ids) state.hints.set(id,page.path);
+      }
+      state.savedHintCount = state.hintPages.size;
+    })().catch(() => {});
+  }
+  await state.hintsLoaded;
+  const hint = record.listingPath || state.records.get(record.id)?.listingPath || state.hints.get(record.id);
+  const rememberHints = async () => {
+    if (record.listingPath || state.savedHintCount === state.hintPages.size) return;
+    if (!state.savingHints) {
+      const count = state.hintPages.size;
+      state.savingHints = env.GALLERY_KV.put(hintKey,JSON.stringify({scope:state.scope,revision:snapshot.revision,
+        pages:[...state.hintPages].map(([path,ids]) => ({path,ids}))}),{expirationTtl:7*24*3600})
+        .then(() => { state.savedHintCount = count; }).catch(() => {}).finally(() => { state.savingHints = null; });
+    }
+    await state.savingHints;
+  };
   if (force) {
     const previous = state.records.get(record.id);
     if (previous && state.pages.get(previous.listingPath)?.settled) state.pages.delete(previous.listingPath);
@@ -372,9 +398,12 @@ async function renewLinks(env, snapshot, record, force = false) {
         const data = await graph(path, env);
         if (!Array.isArray(data?.value)) throw new AppError('앨범 미리보기 목록을 확인할 수 없습니다.');
         await checkLinkOwner(env, snapshot);
+        const ids = [];
         for (const item of data.value) if (isMedia(item) && state.allowed.has(item.id)) {
           state.records.set(item.id, mediaLinks(item, path));
+          state.hints.set(item.id,path); ids.push(item.id);
         }
+        state.hintPages.set(path,ids);
         return data['@odata.nextLink'] || null;
       })();
       const entry = {pending,settled:false}; state.pages.set(path, entry);
@@ -388,7 +417,7 @@ async function renewLinks(env, snapshot, record, force = false) {
     if (force && state.pages.get(hint)?.settled) state.pages.delete(hint);
     try { await readPage(hint); }
     catch (error) { if (![400,404].includes(error.upstreamStatus)) throw error; }
-    if (state.records.has(record.id)) return state.records.get(record.id);
+    if (state.records.has(record.id)) { await rememberHints(); return state.records.get(record.id); }
   }
   // Old snapshots lack page hints. Try newest filenames first; unsupported
   // ordering falls back to the album's normal collection, still stopping early.
@@ -418,6 +447,7 @@ async function renewLinks(env, snapshot, record, force = false) {
     }
     await state.walking;
   }
+  await rememberHints();
   return state.records.get(record.id);
 }
 export async function albumPage(snapshot, env, search, favoriteIds) {

@@ -228,7 +228,12 @@ async function deliverOriginal(target, request, record) {
         if (!next || !allowed(next) || redirects === 3) throw new AppError('사진 원본의 이동 주소를 확인할 수 없습니다.');
         return { next };
       }
-      if (!remote.ok) { await remote.body?.cancel(); throw new AppError('사진 원본 링크가 만료됐거나 다운로드하지 못했습니다. 다시 시도해 주세요.'); }
+      if (!remote.ok) {
+        await remote.body?.cancel();
+        const error = new AppError('사진 원본 링크가 만료됐거나 다운로드하지 못했습니다. 다시 시도해 주세요.');
+        error.originalStatus = remote.status;
+        throw error;
+      }
       if (Number(remote.headers.get('Content-Length')) > 32 * 1024 * 1024) {
         await remote.body?.cancel(); throw new AppError('이 사진은 브라우저 변환 용량을 초과합니다. 원본 열기를 사용해 주세요.', 413);
       }
@@ -324,6 +329,21 @@ async function album(env, force = false, ctx) {
     return promise;
   }
 }
+async function renewOriginalFromAlbum(env, snapshot, id) {
+  // Migrated albums can list their children while rejecting direct item lookups.
+  // Reuse a renewal completed by another request, or coalesce one full refresh.
+  const current = await album(env);
+  const renewed = current.revision !== snapshot.revision ? current : await album(env, true);
+  const connection = await readConnection(env, 'json');
+  if (!connection?.refreshToken || connectionId(connection) !== snapshot.connectionId || renewed.key !== snapshot.key || renewed.connectionId !== snapshot.connectionId) {
+    throw new AppError('이 사진·영상 링크가 만료되었습니다.', 403);
+  }
+  const item = renewed.items.find(item => item.id === id);
+  if (!item) throw new AppError('이 순간은 현재 앨범에 없습니다.', 404);
+  const target = httpsUrl(item.downloadUrl);
+  if (!target) throw new AppError('이 사진·영상의 원본 링크를 받지 못했습니다. 잠시 후 다시 시도해 주세요.');
+  return target;
+}
 export async function albumPage(snapshot, env, search, favoriteIds) {
   const order = ['new', 'old', 'album', 'uploaded'].includes(search.get('sort')) ? search.get('sort') : 'new';
   const type = ['photo', 'video'].includes(search.get('type')) ? search.get('type') : 'all';
@@ -407,7 +427,10 @@ export default {
           const snapshotAge = Date.now() - Date.parse(snapshot.updatedAt);
           // Recently synchronized OneDrive download links can start playback
           // immediately. A retry explicitly requests a fresh item lookup.
-          if (url.searchParams.get('fresh') !== '1' && snapshotAge >= 0 && snapshotAge < SNAPSHOT_REFRESH_MS && httpsUrl(record.downloadUrl)) return await deliverOriginal(httpsUrl(record.downloadUrl), request, record);
+          if (url.searchParams.get('fresh') !== '1' && snapshotAge >= 0 && snapshotAge < SNAPSHOT_REFRESH_MS && httpsUrl(record.downloadUrl)) {
+            try { return await deliverOriginal(httpsUrl(record.downloadUrl), request, record); }
+            catch (error) { if (![401,403,404,410].includes(error.originalStatus)) throw error; }
+          }
           const path = record.driveId ? `/drives/${encodeURIComponent(record.driveId)}/items/${encodeURIComponent(record.id)}` : record.source === 'share'
             ? `/shares/${shareToken(env)}/items/${encodeURIComponent(record.id)}` : `/me/drive/items/${encodeURIComponent(record.id)}`;
           let target;
@@ -417,11 +440,13 @@ export default {
           } catch (error) {
             if (![400, 403, 404].includes(error.upstreamStatus)) throw error;
           }
-          // OneDrive download links expire. Use this fallback only for recently
-          // synchronized migrated albums whose direct item endpoint is unavailable.
-          if (!target && snapshotAge >= 0 && snapshotAge < 45 * 60000) target = httpsUrl(record.downloadUrl);
-          if (!target) throw new AppError('원본 링크를 갱신하지 못했습니다. 관리자 화면에서 앨범 목록을 새로고침해 주세요.');
-          return await deliverOriginal(target, request, record);
+          let renewed = false;
+          if (!target) { target = await renewOriginalFromAlbum(env, snapshot, record.id); renewed = true; }
+          try { return await deliverOriginal(target, request, record); }
+          catch (error) {
+            if (renewed || ![401,403,404,410].includes(error.originalStatus)) throw error;
+            return await deliverOriginal(await renewOriginalFromAlbum(env, snapshot, record.id), request, record);
+          }
         }
         // Some migrated albums do not expose direct child-item metadata paths.
         // The album listing already supplied a short-lived download URL for this specific photo.

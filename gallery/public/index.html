@@ -13,21 +13,20 @@
   <main>
     <section class="intro" aria-label="앨범 프로필"><div class="profile-avatar" aria-hidden="true">j<span>.</span></div><div class="profile-details"><h1 id="title">지안의 순간들</h1><dl class="archive-summary" aria-label="앨범 전체 항목 수"><div><dt>사진</dt><dd id="photo-count">—</dd></div><div><dt>영상</dt><dd id="video-count">—</dd></div></dl></div></section>
     <div class="toolbar" aria-label="사진과 영상 보기 설정">
-      <div class="tabs"><button id="all" class="tab active" aria-pressed="true"><span class="tab-symbol" aria-hidden="true">▦</span> 모든 순간 <span id="total"></span></button><button id="favorite" class="tab" aria-pressed="false">♡ 좋아한 순간 <span id="fav-count"></span></button></div>
+      <div class="tabs"><button id="all" class="tab active" aria-pressed="true">모든 순간 <span id="total"></span></button><button id="favorite" class="tab" aria-pressed="false">♡ 좋아한 순간 <span id="fav-count"></span></button></div>
       <div class="tools"><label class="sr-only" for="media-type">종류</label><select id="media-type"><option value="all">사진 + 영상</option><option value="photo">사진만</option><option value="video">영상만</option></select><label class="sr-only" for="sort">정렬</label><select id="sort"><option value="new">촬영일 최신순</option><option value="old">촬영일 오래된순</option><option value="uploaded">업로드 최신순</option><option value="album">앨범 순서대로</option></select><div class="period-picker"><label for="period">기간</label><select id="period"><option value="day">일</option><option value="week">주</option><option value="month">월</option><option value="year">년</option></select></div><button id="refresh" class="icon-button" aria-label="목록 새로고침" title="새로고침">↻</button></div>
     </div>
     <div id="status" class="status" role="status"><span class="loader"></span><h2>순간들을 불러오는 중이에요</h2><p>잠시만 기다려 주세요.</p></div>
     <button id="retry" class="retry" hidden>다시 불러오기</button>
-    <div id="resume" class="resume" hidden><span>지난번에 보던 순간이 있어요.</span><button id="resume-button">이어서 보기 →</button></div>
     <p id="list-info" class="list-info" role="status" hidden></p>
     <div id="gallery" aria-label="사진과 영상 목록"></div>
     <div id="more-area" class="more-area" hidden><button id="more">더 보기</button><span id="more-state" role="status"></span></div>
-    <p class="privacy-note">촬영일 정보가 없으면 파일명의 날짜나 파일 생성일을 사용해요. 좋아한 순간과 마지막 위치는 이 브라우저에 기억해요.</p>
+    <p class="privacy-note">촬영일 정보가 없으면 파일명의 날짜나 파일 생성일을 사용해요. 좋아한 순간은 이 브라우저에 기억해요.</p>
   </main>
   <footer><span>jian<span class="brand-dot">.</span></span></footer>
 
   <dialog id="viewer" aria-label="사진과 영상 감상">
-    <div class="viewer-top"><span id="counter"></span><div class="viewer-tools"><button id="like" aria-label="사진 좋아하기" aria-pressed="false">♡</button><button id="zoom" aria-label="원본으로 확대" aria-pressed="false">＋</button><button id="play" aria-label="슬라이드쇼 시작" aria-pressed="false">▷</button><button id="fullscreen" aria-label="전체 화면">⛶</button><button id="close" aria-label="사진 닫기">✕</button></div></div>
+    <div class="viewer-top"><span id="counter"></span><div class="viewer-tools"><button id="home" aria-label="메인 갤러리로" title="메인 갤러리로"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 10 9-7 9 7M5 9v12h5v-7h4v7h5V9"/></svg></button><button id="like" aria-label="사진 좋아하기" aria-pressed="false">♡</button></div></div>
     <div id="stage" class="stage"><img id="photo" alt=""><video id="video" controls playsinline preload="none" hidden></video><div id="photo-loading" class="photo-loading" hidden>불러오는 중…</div><div id="photo-error" class="photo-error" hidden><p id="media-error-text">사진을 불러오지 못했어요.</p><button id="photo-retry">다시 시도</button></div></div>
     <button id="previous" class="nav previous" aria-label="이전 사진">‹</button><button id="next" class="nav next" aria-label="다음 사진">›</button>
     <div class="viewer-bottom"><div><span id="photo-date"></span><span id="date-source"></span><span id="quality-status" role="status"></span><span id="photo-name"></span></div><button id="original">원본 열기 ↗</button></div>

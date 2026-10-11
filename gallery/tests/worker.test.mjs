@@ -532,3 +532,42 @@ test('preview streaming rejects non-images, arbitrary redirects and capabilities
     assert.equal(downloads,1);
   }
 });
+
+test('legacy album page hints survive cold Workers and never persist file URLs or grant another connection access', async () => {
+  const env = {...environment(),MS_CLIENT_ID:'durable-legacy-hints'};
+  let pages = [];
+  globalThis.fetch = async input => {
+    const url = String(input);
+    if (url.includes('/oauth2/v2.0/token')) return Response.json({access_token:'hints-token',refresh_token:'hints-refresh',expires_in:3600});
+    if (url.endsWith('/owner-album')) return Response.json({id:'owner-album'});
+    if (url.includes('children')) {
+      const last = url.includes('page=3'); pages.push(url);
+      return Response.json({value:[{id:last ? 'photo-last' : 'photo-first',name:'one.heic',file:{mimeType:'image/heic'},
+        '@microsoft.graph.downloadUrl':'https://photos.example/private-original.heic',thumbnails:[{large:{url:'https://photos.example/private-preview.jpg'}}]}],
+        ...(!last ? {'@odata.nextLink':'https://graph.microsoft.com/v1.0/me/drive/items/owner-album/children?page=' + (url.includes('page=2') ? 3 : 2)} : {})});
+    }
+    if (url.startsWith('https://photos.example/')) return new Response('jpeg',{headers:{'Content-Type':'image/jpeg'}});
+    throw Error('Unexpected hint fixture request');
+  };
+  const first = await (await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).json();
+  const selected = first.items.find(item => item.id === 'photo-last');
+  const cold = () => ({...env,GALLERY_KV:{...env.GALLERY_KV,async get(key,type) {
+    const data = await env.GALLERY_KV.get(key,type);
+    return key.startsWith('album:') && type === 'json' && data ? {...data,updatedAt:new Date(Date.now()-6*3600000).toISOString(),items:data.items.map(({listingPath,...item}) => item)} : data;
+  }}});
+  pages = [];
+  assert.equal((await worker.fetch(new Request(env.PUBLIC_ORIGIN+selected.preview),cold())).status,200);
+  assert.equal(pages.length,3,'the first legacy lookup discovers the target page');
+  pages = [];
+  assert.equal((await worker.fetch(new Request(env.PUBLIC_ORIGIN+selected.preview),cold())).status,200);
+  assert.equal(pages.length,1,'another cold Worker goes straight to the saved third page');
+  assert.ok(pages[0].includes('page=3'));
+  const capability = await verify(selected.preview.split('/').at(-1),env,'media');
+  const saved = await env.GALLERY_KV.get('page-hints:'+capability.scope+':'+capability.connectionId+':'+first.revision,'json');
+  assert.ok(saved.pages.length >= 3);
+  assert.equal(JSON.stringify(saved).includes('photos.example'),false,'only collection paths and album item IDs are persisted');
+  await env.GALLERY_KV.put('connection',JSON.stringify({refreshToken:'different-owner',connectionId:'another-connection'}));
+  pages = [];
+  assert.equal((await worker.fetch(new Request(env.PUBLIC_ORIGIN+selected.preview),cold())).status,403);
+  assert.equal(pages.length,0);
+});

@@ -489,7 +489,12 @@
     $('media-error-text').textContent = '이 영상은 브라우저에서 재생할 수 없거나 링크가 만료됐어요. 원본 열기로 확인해 주세요.';
   });
   $('previous').onclick = () => advance(-1); $('next').onclick = () => advance(1);
-  $('home').onclick = () => { viewer.close(); window.scrollTo({top:0,behavior:reducedMotion.matches ? 'instant' : 'smooth'}); };
+  $('home').onclick = () => {
+    const card = [...document.querySelectorAll('.card')].find(button => button.dataset.photoId === selected?.id);
+    if (card) lastFocused = card;
+    viewer.close();
+    card?.scrollIntoView({block:'nearest',inline:'nearest',behavior:'instant'});
+  };
   viewer.addEventListener('cancel', () => video.pause());
   viewer.addEventListener('close', () => {
     ++showVersion; cancelPhotoLoads(); resetVideo(); image.removeAttribute('src'); resumeThumbnails();

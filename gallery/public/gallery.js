@@ -11,6 +11,19 @@
   const originalCache = new Map();
   const heicCache = new Map(), temporaryURLs = new Set();
   let conversionController, conversionWorker, conversionTimer;
+  const photoTimers = new Set();
+  const thumbnailWaiters = new Map();
+  const startThumbnailTimer = element => {
+    const waiting = thumbnailWaiters.get(element);
+    if (!waiting || waiting.timer || element.complete) return;
+    waiting.timer = setTimeout(() => element.onerror?.(), 25000);
+  };
+  const thumbnailObserver = 'IntersectionObserver' in window ? new IntersectionObserver(entries => {
+    for (const entry of entries) if (entry.isIntersecting) startThumbnailTimer(entry.target);
+  }, {rootMargin:'200px'}) : null;
+  function stopThumbnailTimer(element) {
+    clearTimeout(thumbnailWaiters.get(element)?.timer); thumbnailWaiters.delete(element); thumbnailObserver?.unobserve(element);
+  }
   const isHeic = item => /\.(heic|heif)$/i.test(item?.name || '');
   try { favorites = new Set(JSON.parse(localStorage.getItem('jian-favorites') || '[]')); lastViewed = localStorage.getItem('jian-last-viewed') || ''; } catch {}
   const save = (key, value) => { try { localStorage.setItem(key, value); } catch {} };
@@ -38,16 +51,21 @@
     const button = document.createElement('button'); button.className = 'card'; button.dataset.photoId = item.id;
     button.setAttribute('aria-label', day(displayDate(item)) + ', ' + item.name + (item.kind === 'video' ? ', 영상 보기' : ', 크게 보기'));
     if (item.thumbnail || item.kind !== 'video') {
-      const thumbnail = document.createElement('img'); thumbnail.src = item.thumbnail || item.original;
+      const thumbnail = document.createElement('img');
       thumbnail.alt = ''; thumbnail.loading = index < 6 ? 'eager' : 'lazy'; thumbnail.decoding = 'async';
       if (index < 4) thumbnail.fetchPriority = 'high';
-      let fallback = !item.thumbnail;
+      thumbnail.onload = () => stopThumbnailTimer(thumbnail);
       thumbnail.onerror = () => {
-        if (!fallback && item.kind !== 'video') { fallback = true; thumbnail.src = item.original; return; }
+        stopThumbnailTimer(thumbnail);
+        thumbnail.onload = thumbnail.onerror = null; thumbnail.removeAttribute('src');
         thumbnail.remove();
         const error = document.createElement('span'); error.className = 'card-error'; error.textContent = item.kind === 'video' ? '영상 보기' : '사진 열기'; button.prepend(error);
       };
-      button.append(thumbnail);
+      if (item.thumbnail) {
+        thumbnailWaiters.set(thumbnail,{}); thumbnail.src = item.thumbnail; button.append(thumbnail);
+        if (thumbnailObserver) thumbnailObserver.observe(thumbnail); else startThumbnailTimer(thumbnail);
+      }
+      else thumbnail.onerror();
     }
     if (item.kind === 'video') { const badge = document.createElement('span'); badge.className = 'video-badge'; badge.textContent = '▶ ' + duration(item.duration); button.append(badge); }
     if (favorites.has(item.id)) { const heart = document.createElement('span'); heart.className = 'card-heart'; heart.textContent = '♥'; button.append(heart); }
@@ -60,7 +78,8 @@
     $('fav-count').textContent = onlyFavorites ? page?.matched || '' : favorites.size || '';
     $('all').classList.toggle('active', !onlyFavorites); $('all').setAttribute('aria-pressed', String(!onlyFavorites));
     $('favorite').classList.toggle('active', onlyFavorites); $('favorite').setAttribute('aria-pressed', String(onlyFavorites));
-    const gallery = $('gallery'); if (!append) gallery.replaceChildren();
+    const gallery = $('gallery');
+    if (!append) { for (const element of thumbnailWaiters.keys()) stopThumbnailTimer(element); gallery.replaceChildren(); }
     gallery.dataset.period = $('period').value;
     const albumOrder = $('sort').value === 'album';
     $('period').disabled = albumOrder;
@@ -88,7 +107,7 @@
     $('more').disabled = paging;
     $('more-state').textContent = paging ? '다음 순간들을 불러오는 중…' : '';
   }
-  function cacheKey() { return 'jian-page-v3:' + $('sort').value + ':' + $('media-type').value + ':' + (onlyFavorites ? [...favorites].sort().join(',') : 'all'); }
+  function cacheKey() { return 'jian-page-v4:' + $('sort').value + ':' + $('media-type').value + ':' + (onlyFavorites ? [...favorites].sort().join(',') : 'all'); }
   function cachedPage() {
     try { const cached = JSON.parse(sessionStorage.getItem(cacheKey()) || 'null'); return cached && Date.now() - cached.savedAt < 5 * 60000 ? cached.data : null; } catch { return null; }
   }
@@ -159,11 +178,25 @@
   }
   function resetVideo() { video.pause(); video.removeAttribute('src'); video.removeAttribute('poster'); video.load(); video.hidden = true; }
   function cancelPhotoLoads() {
+    for (const timer of photoTimers) clearTimeout(timer); photoTimers.clear();
     for (const pending of [previewLoad, originalLoad]) if (pending) { pending.onload = pending.onerror = null; pending.removeAttribute('src'); }
     conversionController?.abort(); conversionController = null;
     conversionWorker?.terminate(); conversionWorker = null; clearTimeout(conversionTimer);
     for (const url of temporaryURLs) URL.revokeObjectURL(url); temporaryURLs.clear();
     previewLoad = originalLoad = null; originalReady = false; zoomRequested = false;
+  }
+  function timedPhoto(element, src, milliseconds = 25000) {
+    const onload = element.onload, onerror = element.onerror;
+    let finished = false;
+    const settle = (callback, event) => {
+      if (finished) return; finished = true; clearTimeout(timer); photoTimers.delete(timer);
+      element.onload = onload; element.onerror = onerror; callback?.call(element,event);
+    };
+    const timer = setTimeout(() => {
+      element.onload = element.onerror = null; element.removeAttribute('src'); settle(onerror);
+    }, milliseconds);
+    photoTimers.add(timer);
+    element.onload = event => settle(onload,event); element.onerror = event => settle(onerror,event); element.src = src;
   }
   function rememberHeic(id, url, size, converted) {
     if (size > 24 * 1024 * 1024) return;
@@ -212,7 +245,7 @@
     clearTimeout(timer); cancelPhotoLoads(); setZoom(false); resetVideo(); current = index; selected = visible[index];
     const item = selected, version = ++showVersion, isVideo = item.kind === 'video';
     $('photo-loading').hidden = isVideo; $('photo-loading').textContent = isVideo ? '영상을 불러오는 중…' : '사진을 불러오는 중…'; $('photo-error').hidden = true;
-    image.removeAttribute('src'); image.alt = item.name; image.hidden = isVideo; $('zoom').hidden = isVideo;
+    image.removeAttribute('src'); image.alt = item.name; image.hidden = true; $('zoom').hidden = isVideo;
     image.removeAttribute('data-quality'); quality(isVideo ? '' : '원본 화질 불러오는 중…', 'loading'); $('quality-status').hidden = isVideo;
     $('counter').textContent = (baseOffset + index + 1) + ' / ' + page.matched;
     $('photo-date').textContent = day(displayDate(item)); $('photo-name').textContent = item.name;
@@ -233,7 +266,7 @@
     let displayed = false, previewFailed = false, originalFailed = false, originalFailureText = '미리보기 · 원본을 불러오지 못했어요';
     function display(src, full, converted = false) {
       if (!active() || (!full && originalReady)) return;
-      image.src = src; image.dataset.quality = full ? converted ? 'converted' : 'original' : 'preview'; $('photo-loading').hidden = true; $('photo-error').hidden = true;
+      image.src = src; image.hidden = false; image.dataset.quality = full ? converted ? 'converted' : 'original' : 'preview'; $('photo-loading').hidden = true; $('photo-error').hidden = true;
       if (full) {
         originalReady = true; quality(converted ? '원본 해상도 · HEIC 변환' : '원본 화질', converted ? 'converted' : 'original');
         if (!src.startsWith('blob:')) {
@@ -253,14 +286,14 @@
       if (displayed) { quality(originalFailureText, 'preview'); return; }
       if (previewFailed && originalFailed) {
         $('photo-loading').hidden = true; $('photo-error').hidden = false; quality('', 'error');
-        $('media-error-text').textContent = '사진을 불러오지 못했어요. 원본 열기로 확인해 주세요.'; stop();
+        $('media-error-text').textContent = originalFailureText.replace(/^미리보기 · /,'') + '. 다시 시도하거나 원본 열기로 확인해 주세요.'; stop();
       }
     }
     const previewURL = item.preview || item.thumbnail;
     if (previewURL) {
       const preview = previewLoad = new Image(); preview.decoding = 'async';
       preview.onload = () => display(preview.src, false);
-      preview.onerror = () => { previewFailed = true; failure(); }; preview.src = previewURL;
+      preview.onerror = () => { previewFailed = true; failure(); }; timedPhoto(preview,previewURL,12000);
     } else previewFailed = true;
     const full = originalLoad = new Image(); full.decoding = 'async'; full.fetchPriority = 'high';
     if (isHeic(item)) {
@@ -306,13 +339,13 @@
       if (!active()) return;
       if (!retried) {
         retried = true;
-        try { const url = await freshOriginal(item.id); if (active()) { full.src = url; return; } } catch {}
+        try { const url = await freshOriginal(item.id); if (active()) { timedPhoto(full,url); return; } } catch {}
       }
       if (!active()) return;
       originalFailed = true; zoomRequested = false; failure();
     };
     const cached = originalCache.get(item.id);
-    full.src = cached && Date.now() - cached.savedAt < 30 * 60000 ? cached.url : item.original;
+    timedPhoto(full,cached && Date.now() - cached.savedAt < 30 * 60000 ? cached.url : item.original);
   }
   function open(id, source) { const index = visible.findIndex(item => item.id === id); if (index < 0) return; lastFocused = source || document.activeElement; viewer.showModal(); show(index); }
   async function advance(direction, manual = true) {

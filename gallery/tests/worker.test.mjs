@@ -346,3 +346,105 @@ test('photo byte download rejects an unrelated redirect and excessive conversion
     assert.ok((await result.json()).error);
   }
 });
+
+test('an old migrated album renews originals through its supported listing when item metadata is unavailable', async () => {
+  const env = {...environment(), MS_CLIENT_ID:'migrated-original-renewal'};
+  let scans = 0, lookups = 0;
+  globalThis.fetch = async input => {
+    const url = String(input);
+    if (url.includes('/oauth2/v2.0/token')) return Response.json({access_token:'renewal-token',refresh_token:'renewal-refresh',expires_in:3600});
+    if (url.endsWith('/owner-album')) return Response.json({id:'owner-album'});
+    if (url.includes('children')) {
+      scans++;
+      return Response.json({value:[{id:'photo-one',name:'one.heic',file:{mimeType:'image/heic'},'@microsoft.graph.downloadUrl':`https://photos.example/${scans === 1 ? 'expired' : 'renewed'}.heic`}]});
+    }
+    if (url.endsWith('/photo-one')) { lookups++; return new Response(null,{status:404}); }
+    throw Error('Unexpected renewal request');
+  };
+  const first = await (await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).json();
+  const coldEnv = {...env,GALLERY_KV:{...env.GALLERY_KV,async get(key,type) {
+    const value = await env.GALLERY_KV.get(key,type);
+    if (key.startsWith('album:') && type === 'json' && value) return {...value,updatedAt:new Date(Date.now()-60*60000).toISOString()};
+    return value;
+  }}};
+  const original = await worker.fetch(new Request(env.PUBLIC_ORIGIN+first.items[0].original),coldEnv);
+  assert.equal(original.status,303);
+  assert.equal(original.headers.get('Location'),'https://photos.example/renewed.heic');
+  assert.equal(scans,2); assert.equal(lookups,1);
+  const second = await worker.fetch(new Request(env.PUBLIC_ORIGIN+first.items[0].original),coldEnv);
+  assert.equal(second.status,303); assert.equal(scans,2,'reuse renewed snapshot instead of scanning on every selection');
+});
+
+test('expired photo bytes renew once for concurrent requests', async () => {
+  const env = {...environment(),MS_CLIENT_ID:'expired-bytes-renewal'};
+  let scans = 0, downloads = 0, startRefresh, finishRefresh;
+  const started = new Promise(resolve => { startRefresh = resolve; });
+  const released = new Promise(resolve => { finishRefresh = resolve; });
+  globalThis.fetch = async (input,init) => {
+    const url = String(input);
+    if (url.includes('/oauth2/v2.0/token')) return Response.json({access_token:'bytes-token',refresh_token:'bytes-refresh',expires_in:3600});
+    if (url.endsWith('/owner-album')) return Response.json({id:'owner-album'});
+    if (url.includes('children')) {
+      scans++;
+      if (scans > 1) { startRefresh(); await released; }
+      return Response.json({value:[{id:'photo-one',name:'one.heic',file:{mimeType:'image/heic'},'@microsoft.graph.downloadUrl':`https://photos.example/${scans === 1 ? 'expired' : 'renewed'}.heic`}]});
+    }
+    if (url.endsWith('/photo-one')) return new Response(null,{status:404});
+    assert.equal(url.startsWith('https://photos.example/'),true);
+    assert.equal(init.headers?.Authorization,undefined); assert.equal(init.headers?.Cookie,undefined);
+    downloads++;
+    return url.endsWith('/expired.heic') ? new Response(null,{status:403}) : new Response('valid-heic-bytes',{headers:{'Content-Type':'image/heic'}});
+  };
+  const list = await (await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).json();
+  const path = list.items[0].original+'?mode=bytes';
+  const first = worker.fetch(new Request(env.PUBLIC_ORIGIN+path),env);
+  const second = worker.fetch(new Request(env.PUBLIC_ORIGIN+path),env);
+  await started; finishRefresh();
+  for (const response of await Promise.all([first,second])) {
+    assert.equal(response.status,200); assert.equal(await response.text(),'valid-heic-bytes');
+  }
+  assert.equal(scans,2,'concurrent failures share one album refresh');
+  assert.ok(downloads >= 3 && downloads <= 4,'a request may reuse the already-renewed snapshot, with at most one failed cached download');
+});
+
+test('a fresh retry on a migrated album obtains a new listing instead of redirecting to the cached URL', async () => {
+  const env = {...environment(),MS_CLIENT_ID:'fresh-migrated-renewal'};
+  let scans = 0;
+  globalThis.fetch = async input => {
+    const url = String(input);
+    if (url.includes('/oauth2/v2.0/token')) return Response.json({access_token:'fresh-token',refresh_token:'fresh-refresh',expires_in:3600});
+    if (url.endsWith('/owner-album')) return Response.json({id:'owner-album'});
+    if (url.includes('children')) {
+      scans++;
+      return Response.json({value:[{id:'photo-one',name:'one.jpg',file:{mimeType:'image/jpeg'},'@microsoft.graph.downloadUrl':`https://photos.example/${scans === 1 ? 'expired' : 'renewed'}.jpg`}]});
+    }
+    return new Response(null,{status:404});
+  };
+  const list = await (await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).json();
+  const original = await worker.fetch(new Request(env.PUBLIC_ORIGIN+list.items[0].original+'?fresh=1'),env);
+  assert.equal(original.status,303); assert.equal(original.headers.get('Location'),'https://photos.example/renewed.jpg');
+  assert.equal(scans,2);
+});
+
+test('original renewal rejects items removed from the album or an owner changed during the refresh', async () => {
+  for (const changeOwner of [false,true]) {
+    const env = {...environment(),MS_CLIENT_ID:'renewal-membership-'+changeOwner};
+    let scans = 0;
+    globalThis.fetch = async input => {
+      const url = String(input);
+      if (url.includes('/oauth2/v2.0/token')) return Response.json({access_token:'membership-token',refresh_token:'membership-refresh',expires_in:3600});
+      if (url.endsWith('/owner-album')) return Response.json({id:'owner-album'});
+      if (url.includes('children')) {
+        scans++;
+        if (scans > 1 && changeOwner) await env.GALLERY_KV.put('connection',JSON.stringify({refreshToken:'other-owner',connectionId:'other-owner'}));
+        return Response.json({value:scans > 1 && !changeOwner ? [] : [{id:'photo-one',name:'one.heic',file:{mimeType:'image/heic'},'@microsoft.graph.downloadUrl':'https://photos.example/one.heic'}]});
+      }
+      assert.equal(url.startsWith('https://photos.example/'),false,'removed or different-owner bytes must not be fetched');
+      return new Response(null,{status:404});
+    };
+    const list = await (await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).json();
+    const original = await worker.fetch(new Request(env.PUBLIC_ORIGIN+list.items[0].original+'?fresh=1&mode=bytes'),env);
+    assert.equal(original.status,changeOwner ? 403 : 404);
+    assert.equal(scans,2);
+  }
+});

@@ -67,7 +67,7 @@ const albumStates = new WeakMap();
 const SNAPSHOT_VERSION = 3;
 const PAGE_SIZE = 60;
 const SNAPSHOT_REFRESH_MS = 15 * 60000;
-const BUILD_ID = '2026-10-12-invite-fast-grid-v10';
+const BUILD_ID = '2026-10-12-invite-fast-grid-v10.1';
 // Grid image links stay identical for a 12-hour window so the browser cache can reuse them.
 // Windows turn over at 04:00 and 16:00 KST, away from evening viewing; a link lives 12–24 hours.
 const GRID_WINDOW_MS = 12 * 3600000;

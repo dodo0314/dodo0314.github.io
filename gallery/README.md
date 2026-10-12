@@ -13,7 +13,7 @@
 순서를 지켜 적용합니다.
 
 1. Cloudflare → Workers & Pages → `jian` → Settings → Variables and Secrets → Add. 이름 `VIEWER_KEY`, 종류 **Secret**, 값은 20자 이상 무작위 문자열입니다. 이 값은 저장소·채팅에 넣지 않습니다.
-2. 최신 `dist/worker.mjs` 전체를 Edit code에 교체하고 Deploy합니다. 1단계 없이 배포하면 갤러리는 잠긴 채로 열립니다. 버전은 `X-Gallery-Build: 2026-10-12-invite-fast-grid-v10`입니다. Microsoft 재연결이나 관리자 앨범 새로고침은 필요하지 않습니다.
+2. 최신 `dist/worker.mjs` 전체를 Edit code에 교체하고 Deploy합니다. 1단계 없이 배포하면 갤러리는 잠긴 채로 열립니다. 버전은 `X-Gallery-Build: 2026-10-12-invite-fast-grid-v10.1`입니다(v10에 아이폰 Safari의 캐시 판별 수정을 더한 판). Microsoft 재연결이나 관리자 앨범 새로고침은 필요하지 않습니다.
 3. `/admin`에 로그인하면 **초대 링크**(`https://jian.jahab.workers.dev/#k=…`)가 표시됩니다. 볼 사람에게만 직접 보냅니다.
 4. 각 기기에서 초대 링크를 한 번 엽니다. 같은 브라우저는 180일 동안 다시 묻지 않고, 남은 기간이 절반보다 짧으면 방문할 때 자동 연장합니다. 시크릿 창은 닫으면 입장 정보가 지워져 다시 초대 링크로 열어야 합니다. 카카오톡 안의 브라우저와 Safari는 입장 정보를 따로 보관합니다.
 

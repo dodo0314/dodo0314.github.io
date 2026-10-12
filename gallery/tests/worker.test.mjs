@@ -740,11 +740,11 @@ test('previews of an old list skip its expired saved links and renew through the
   assert.equal(reads.length,before); assert.equal(downloads.length,1);
 });
 
-test('a Worker keeps its parsed album list while a small revision key says it is current', async () => {
+test('a Worker keeps its parsed album list while a small generation key says it is current', async () => {
   const env = {...environment(),MS_CLIENT_ID:'revision-key'}; mockGraph(1);
   const get = env.GALLERY_KV.get; let fullReads = 0, revisionReads = 0;
   env.GALLERY_KV.get = async (key,type) => {
-    if (key.startsWith('album:') && key.endsWith(':revision')) revisionReads++;
+    if (key.startsWith('album:') && key.endsWith(':generation')) revisionReads++;
     else if (key.startsWith('album:')) fullReads++;
     return get(key,type);
   };
@@ -756,15 +756,64 @@ test('a Worker keeps its parsed album list while a small revision key says it is
     assert.equal((await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).status,200);
     assert.equal(revisionReads,1); assert.equal(fullReads,0,'an unchanged list is not read and parsed again');
     const albumKey = (await verify(first.items[0].original.split('/').at(-1),env,'media')).scope;
-    assert.equal(await get(albumKey+':revision'),first.revision);
-    await env.GALLERY_KV.put(albumKey+':revision','saved-by-another-worker');
+    assert.equal(await get(albumKey+':generation'),first.revision+'@'+first.updatedAt);
+    await env.GALLERY_KV.put(albumKey+':generation','saved-by-another-worker');
     mock.timers.setTime(Date.now()+61000);
     assert.equal((await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).status,200);
-    assert.equal(fullReads,1,'a different revision reloads the list');
-    await env.GALLERY_KV.delete(albumKey+':revision');
+    assert.equal(fullReads,1,'a different generation reloads the list');
+    await env.GALLERY_KV.delete(albumKey+':generation');
     mock.timers.setTime(Date.now()+61000);
     await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env);
     await new Promise(resolve => setImmediate(resolve));
-    assert.equal(fullReads,2); assert.equal(await get(albumKey+':revision'),first.revision,'a list saved before this version gets its revision key');
+    assert.equal(fullReads,2); assert.equal(await get(albumKey+':generation'),first.revision+'@'+first.updatedAt,'a list saved before this version gets its generation key');
   } finally { mock.timers.reset(); }
+});
+
+test('a scheduled refresh renews saved links without changing the revision visitors page with', async () => {
+  const env = {...environment(),MS_CLIENT_ID:'scheduled-refresh'};
+  let phase = 'first', extra = false;
+  globalThis.fetch = async input => {
+    const url = String(input);
+    if (url.includes('/oauth2/v2.0/token')) return Response.json({access_token:'cron-token',refresh_token:'cron-refresh',expires_in:3600});
+    if (url.endsWith('/owner-album')) return Response.json({id:'owner-album'});
+    if (url.includes('children')) return Response.json({value:[
+      {id:'photo-one',name:'one.jpg',file:{mimeType:'image/jpeg'},photo:{takenDateTime:'2026-01-01T00:00:00Z'},thumbnails:[{medium:{url:`https://photos.example/${phase}-one.jpg`}}]},
+      ...(extra ? [{id:'photo-new',name:'new.jpg',file:{mimeType:'image/jpeg'},photo:{takenDateTime:'2026-02-01T00:00:00Z'},thumbnails:[{medium:{url:'https://photos.example/new.jpg'}}]}] : [])]});
+    if (url.startsWith('https://photos.example/')) return new Response(url,{headers:{'Content-Type':'image/jpeg'}});
+    throw Error('Unexpected '+url);
+  };
+  const run = async target => { const work = []; await gallery.scheduled({cron:'*/10 * * * *'},target,{waitUntil: promise => work.push(promise)}); await Promise.all(work); };
+  await run(env);
+  const first = await (await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).json();
+  assert.equal(first.total,1);
+  phase = 'renewed';
+  await new Promise(resolve => setTimeout(resolve,5));
+  await run(env);
+  const second = await (await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).json();
+  assert.equal(second.revision,first.revision,'renewed links alone keep the revision');
+  assert.notEqual(second.updatedAt,first.updatedAt);
+  assert.equal((await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album?offset=60&revision='+first.revision),env)).status,200,'paging continues across the refresh');
+  const image = await worker.fetch(new Request(env.PUBLIC_ORIGIN+second.items[0].thumbnail),env);
+  assert.equal(await image.text(),'https://photos.example/renewed-one.jpg'); assert.match(image.headers.get('Server-Timing'),/link;desc="stored"/);
+  extra = true; await run(env);
+  const third = await (await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).json();
+  assert.equal(third.total,2); assert.notEqual(third.revision,first.revision,'a changed album gets a new revision');
+  const session = await sign({kind:'admin',exp:Date.now()+60000},env);
+  assert.match(await (await gallery.fetch(new Request(env.PUBLIC_ORIGIN+'/admin',{headers:{Cookie:'jian_admin='+session}}),env)).text(),/저장된 사진 목록은 0분 전에 갱신했습니다/);
+});
+
+test('a failed scheduled refresh is shown to the administrator and recorded at most hourly', async () => {
+  const env = {...environment(),MS_CLIENT_ID:'scheduled-failure'};
+  globalThis.fetch = async input => String(input).includes('/oauth2/v2.0/token')
+    ? Response.json({access_token:'cron-token',refresh_token:'cron-refresh',expires_in:3600}) : new Response(null,{status:500});
+  const put = env.GALLERY_KV.put; let errorWrites = 0;
+  env.GALLERY_KV.put = async (key,value,options) => { if (key === 'scheduled-refresh-error') errorWrites++; return put(key,value,options); };
+  const run = async () => { const work = []; await gallery.scheduled({},env,{waitUntil: promise => work.push(promise)}); await Promise.all(work); };
+  await run(); await run();
+  assert.equal(errorWrites,1,'an identical failure within the hour is not written again');
+  const session = await sign({kind:'admin',exp:Date.now()+60000},env);
+  const html = await (await gallery.fetch(new Request(env.PUBLIC_ORIGIN+'/admin',{headers:{Cookie:'jian_admin='+session}}),env)).text();
+  assert.match(html,/마지막 예약 갱신 실패\(0분 전\): 앨범을 불러오지 못했습니다 \(500\)/);
+  assert.doesNotMatch(html,/cron-token|cron-refresh/);
+  assert.doesNotMatch(await (await gallery.fetch(new Request(env.PUBLIC_ORIGIN+'/admin'),env)).text(),/예약 갱신 실패/,'only a logged-in administrator sees it');
 });

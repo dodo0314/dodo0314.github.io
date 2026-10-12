@@ -67,7 +67,7 @@ const albumStates = new WeakMap();
 const SNAPSHOT_VERSION = 3;
 const PAGE_SIZE = 60;
 const SNAPSHOT_REFRESH_MS = 15 * 60000;
-const BUILD_ID = '2026-10-12-invite-fast-grid-v12';
+const BUILD_ID = '2026-10-12-invite-fast-grid-v13';
 // Grid image links stay identical for a 12-hour window so the browser cache can reuse them.
 // Windows turn over at 04:00 and 16:00 KST, away from evening viewing; a link lives 12–24 hours.
 const GRID_WINDOW_MS = 12 * 3600000;
@@ -394,22 +394,27 @@ export async function readAlbum(env, connection) {
     }
     next = data['@odata.nextLink'] || null;
   }
+  // The revision names the list's content, not its links: a scheduled refresh that only renews links
+  // keeps it, so visitors paging through the album are not sent back to the top.
+  const content = JSON.stringify(items.map(({ thumbnail, preview, downloadUrl, listingPath, ...item }) => item));
   return { title: env.ALBUM_TITLE || root.name || '지안의 순간들', items,
     counts: { photo: items.filter(item => item.kind === 'photo').length, video: items.filter(item => item.kind === 'video').length },
-    updatedAt: new Date().toISOString(), revision: random() };
+    updatedAt: new Date().toISOString(), revision: base64url(await crypto.subtle.digest('SHA-256', encoder.encode(content))).slice(0, 22) };
 }
+// Changes on every save, even when the revision does not, so Workers notice renewed links.
+function generation(snapshot) { return snapshot.revision + '@' + snapshot.updatedAt; }
 async function album(env, force = false, ctx) {
   requireConfig(env);
   const connection = await readConnection(env, 'json');
   if (!connection?.refreshToken) throw new AppError('아직 사진 앨범이 연결되지 않았습니다.');
   const key = await albumKey(env), state = albumState(env), identity = connectionId(connection);
   const valid = snapshot => snapshot?.version === SNAPSHOT_VERSION && snapshot.key === key && snapshot.connectionId === identity && Array.isArray(snapshot.items);
-  // The full list holds every item's links (megabytes of JSON). A small revision key tells
+  // The full list holds every item's links (megabytes of JSON). A small generation key tells
   // whether the copy in memory is still current, so it is not re-read and re-parsed every minute.
-  let savedRevision;
+  let savedGeneration;
   if (!force && valid(state.snapshot) && Date.now() - state.checkedAt >= 60000) {
-    savedRevision = await step('저장된 앨범 목록 읽기', () => env.GALLERY_KV.get(key + ':revision'));
-    if (savedRevision === state.snapshot.revision) state.checkedAt = Date.now();
+    savedGeneration = await step('저장된 앨범 목록 읽기', () => env.GALLERY_KV.get(key + ':generation'));
+    if (savedGeneration === generation(state.snapshot)) state.checkedAt = Date.now();
   }
   if (!force && valid(state.snapshot) && Date.now() - state.checkedAt < 60000) {
     if (Date.now() - Date.parse(state.snapshot.updatedAt) >= SNAPSHOT_REFRESH_MS && ctx?.waitUntil) ctx.waitUntil(refresh().catch(() => {}));
@@ -419,9 +424,9 @@ async function album(env, force = false, ctx) {
     const stored = await step('저장된 앨범 목록 읽기', () => env.GALLERY_KV.get(key, 'json'));
     if (valid(stored)) {
       state.snapshot = stored; state.checkedAt = Date.now();
-      if (savedRevision === null) {
-        // Lists saved before the revision key existed get one on first use.
-        const saving = env.GALLERY_KV.put(key + ':revision', stored.revision).catch(() => {});
+      if (savedGeneration === null) {
+        // Lists saved before the generation key existed get one on first use.
+        const saving = env.GALLERY_KV.put(key + ':generation', generation(stored)).catch(() => {});
         ctx?.waitUntil?.(saving);
       }
       if (Date.now() - Date.parse(stored.updatedAt) >= SNAPSHOT_REFRESH_MS && ctx?.waitUntil) ctx.waitUntil(refresh().catch(() => {}));
@@ -436,9 +441,9 @@ async function album(env, force = false, ctx) {
       const data = await step('사진·영상 목록 구성', () => readAlbum(env, connection));
       const snapshot = { ...data, version: SNAPSHOT_VERSION, key, connectionId: identity };
       await step('앨범 목록 KV 저장', () => env.GALLERY_KV.put(key, JSON.stringify(snapshot)));
-      // If the revision key cannot be updated, remove it: Workers then re-read the full list as before
+      // If the generation key cannot be updated, remove it: Workers then re-read the full list as before
       // instead of trusting an older copy.
-      await env.GALLERY_KV.put(key + ':revision', snapshot.revision).catch(() => env.GALLERY_KV.delete(key + ':revision').catch(() => {}));
+      await env.GALLERY_KV.put(key + ':generation', generation(snapshot)).catch(() => env.GALLERY_KV.delete(key + ':generation').catch(() => {}));
       state.snapshot = snapshot; state.checkedAt = Date.now();
       return snapshot;
     })();
@@ -599,7 +604,15 @@ export async function albumPage(snapshot, env, search, favoriteIds) {
     nextOffset: offset + PAGE_SIZE < ordered.length ? offset + PAGE_SIZE : null,
     revision: snapshot.revision, updatedAt: snapshot.updatedAt, sort: order, type };
 }
-function adminPage(env, loggedIn, status = '', connected = false) {
+async function refreshInfo(env) {
+  try {
+    const [saved, failure] = await Promise.all([env.GALLERY_KV.get(await albumKey(env) + ':generation'), env.GALLERY_KV.get('scheduled-refresh-error', 'json')]);
+    return { updatedAt: saved ? Date.parse(saved.slice(saved.indexOf('@') + 1)) : NaN, failure };
+  } catch { return {}; }
+}
+function adminPage(env, loggedIn, status = '', connected = false, info = {}) {
+  const minutes = at => Math.max(0, Math.round((Date.now() - at) / 60000)) + '분 전';
+  const failed = info.failure && Date.parse(info.failure.at) > (info.updatedAt || 0);
   const missing = ['MS_CLIENT_ID', 'MS_CLIENT_SECRET', 'ADMIN_PASSWORD', 'GALLERY_KV', 'VIEWER_KEY'].filter(name => name === 'VIEWER_KEY' ? !viewerConfigured(env) : !env[name]);
   let site = 'https://jian.jahab.workers.dev';
   try { site = origin(env); } catch { /* The configuration notice above covers an invalid origin. */ }
@@ -608,6 +621,7 @@ function adminPage(env, loggedIn, status = '', connected = false) {
     ${status ? `<p class="status">${esc(status)}</p>` : ''}
     ${missing.length ? `<p>Cloudflare 설정이 필요합니다: ${esc(missing.join(', '))}${missing.includes('VIEWER_KEY') ? ' (VIEWER_KEY는 20자 이상의 Secret입니다. 설정 전에는 갤러리가 잠겨 있습니다.)' : ''}</p>` : ''}
     ${loggedIn && viewerConfigured(env) ? `<p><label for="invite">초대 링크 — 볼 사람에게만 직접 보내세요</label><input id="invite" readonly value="${esc(site + '/#k=' + encodeURIComponent(env.VIEWER_KEY))}">VIEWER_KEY를 바꾸면 이 링크와 이미 입장한 모든 기기가 무효가 됩니다.</p>` : ''}
+    ${loggedIn && (info.updatedAt || failed) ? `<p class="status">${info.updatedAt ? `저장된 사진 목록은 ${minutes(info.updatedAt)}에 갱신했습니다. 예약 갱신(Cron Trigger)이 켜져 있으면 늘 10분 안팎이어야 합니다.` : ''}${failed ? ` 마지막 예약 갱신 실패(${minutes(Date.parse(info.failure.at))}): ${esc(info.failure.message)}` : ''}</p>` : ''}
     ${loggedIn ? `<p>${connected === null ? '이 화면에서는 OneDrive 연결 상태를 확인하지 못했습니다.' : connected ? 'OneDrive가 연결되어 있습니다.' : 'OneDrive를 연결해 주세요.'} 앨범을 소유한 Microsoft 계정으로 로그인하세요.</p>
       <form action="/admin/connect" method="post"><button>OneDrive ${connected ? '다시 ' : ''}연결</button></form>
       <form action="/admin/check" method="post"><button>앨범 연결 확인·새로고침</button></form>
@@ -723,7 +737,7 @@ export default {
       if (url.pathname === '/admin' && request.method === 'GET') {
         const authenticated = !!await admin(request, env);
         const connected = authenticated && !!await readConnection(env);
-        return response(adminPage(env, authenticated, '', connected));
+        return response(adminPage(env, authenticated, '', connected, authenticated ? await refreshInfo(env) : {}));
       }
       if (url.pathname === '/admin/login' && request.method === 'POST') {
         requireOrigin(request, env); requireConfig(env);
@@ -749,13 +763,13 @@ export default {
         }
         if (url.pathname === '/admin/check') {
           const data = await album(env, true);
-          return response(adminPage(env, true, `앨범 연결 확인: 사진 ${data.counts.photo}장 · 영상 ${data.counts.video}개. 빠른 조회용 목록을 저장했습니다.`, true));
+          return response(adminPage(env, true, `앨범 연결 확인: 사진 ${data.counts.photo}장 · 영상 ${data.counts.video}개. 빠른 조회용 목록을 저장했습니다.`, true, await refreshInfo(env)));
         }
         if (url.pathname === '/admin/disconnect') {
           await step('KV 연결 정보 삭제', () => env.GALLERY_KV.delete('connection'));
           await step('앨범 목록 삭제', async () => {
             const key = await albumKey(env);
-            await Promise.all([env.GALLERY_KV.delete(key), env.GALLERY_KV.delete(key + ':revision')]);
+            await Promise.all([env.GALLERY_KV.delete(key), env.GALLERY_KV.delete(key + ':generation'), env.GALLERY_KV.delete(key + ':revision')]);
           });
           tokenCache = null; albumStates.delete(env.GALLERY_KV);
           return response(adminPage(env, true, '연결을 해제했습니다. 이미 방문자가 받은 사진은 회수되지 않습니다.'));
@@ -784,5 +798,19 @@ export default {
       }
       return json({ error: message }, e.status || 503);
     }
+  },
+  // Cron Trigger (dashboard: Settings → Triggers → Cron Triggers, e.g. */10 * * * *). Renewing the saved
+  // list ahead of visitors keeps its preview links valid, so a first visit skips the album-page renewal
+  // that measured up to 7.5 s per image.
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(album(env, true).catch(async error => {
+      const failure = { at: new Date().toISOString(),
+        message: (error instanceof AppError ? error.message : '목록을 갱신하지 못했습니다.') + (error?.diagnostic ? ` [실패 단계: ${error.diagnostic}]` : '') };
+      try {
+        // The same failure is recorded at most hourly, sparing the daily KV write limit.
+        const last = await env.GALLERY_KV.get('scheduled-refresh-error', 'json');
+        if (last?.message !== failure.message || Date.now() - Date.parse(last.at) > 3600000) await env.GALLERY_KV.put('scheduled-refresh-error', JSON.stringify(failure));
+      } catch { /* Without KV there is nowhere to record it. */ }
+    }));
   },
 };

@@ -15,7 +15,7 @@ const albumStates = new WeakMap();
 const SNAPSHOT_VERSION = 3;
 const PAGE_SIZE = 60;
 const SNAPSHOT_REFRESH_MS = 15 * 60000;
-const BUILD_ID = '2026-10-12-loading-v6.1';
+const BUILD_ID = '2026-10-12-original-actions-v7';
 let signingKey;
 
 class AppError extends Error {
@@ -210,11 +210,18 @@ function httpsUrl(value) {
   try { const url = new URL(value); return url.protocol === 'https:' ? url.href : ''; } catch { return ''; }
 }
 async function deliverOriginal(target, request, record) {
-  if (new URL(request.url).searchParams.get('mode') !== 'bytes') return redirect(target);
-  if (record?.kind !== 'photo') throw new AppError('이 항목은 사진 원본이 아닙니다.', 400);
-  return streamImage(target);
+  const mode = new URL(request.url).searchParams.get('mode');
+  if (!['bytes', 'download'].includes(mode)) return redirect(target);
+  if (mode === 'bytes' && record?.kind !== 'photo') throw new AppError('이 항목은 사진 원본이 아닙니다.', 400);
+  return streamImage(target, false, mode === 'download' ? record.name || 'original' : null);
 }
-async function streamImage(target, preview = false) {
+function attachment(name) {
+  const clean = String(name).replace(/[\u0000-\u001f\u007f/\\]/g, '_');
+  const fallback = clean.replace(/[^\x20-\x7e]|["\\;]/g, '_') || 'original';
+  const encoded = encodeURIComponent(clean).replace(/['()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+}
+async function streamImage(target, preview = false, downloadName = null) {
   // Only an authenticated Graph result / album snapshot supplies this URL.
   // Never forward the visitor's headers or the owner's Microsoft access token.
   const initial = new URL(target);
@@ -239,7 +246,7 @@ async function streamImage(target, preview = false) {
         error.originalStatus = remote.status;
         throw error;
       }
-      if (Number(remote.headers.get('Content-Length')) > (preview ? 8 : 32) * 1024 * 1024) {
+      if (downloadName === null && Number(remote.headers.get('Content-Length')) > (preview ? 8 : 32) * 1024 * 1024) {
         await remote.body?.cancel(); throw new AppError('이 사진은 브라우저 변환 용량을 초과합니다. 원본 열기를 사용해 주세요.', 413);
       }
       if (preview && !remote.headers.get('Content-Type')?.toLowerCase().startsWith('image/')) {
@@ -247,7 +254,8 @@ async function streamImage(target, preview = false) {
       }
       return { response: response(remote.body, 200, {
         'Content-Type': remote.headers.get('Content-Type') || 'application/octet-stream',
-        'Cache-Control': preview ? 'private, max-age=300' : 'private, no-store', 'Content-Disposition': 'inline',
+        'Cache-Control': preview ? 'private, max-age=300' : 'private, no-store',
+        'Content-Disposition': downloadName === null ? 'inline' : attachment(downloadName),
       }) };
     });
     if (result.next) { url = result.next; continue; }
@@ -561,7 +569,7 @@ export default {
         }
         // Some migrated albums do not expose direct child-item metadata paths.
         // The album listing already supplied a short-lived download URL for this specific photo.
-        if (isPreview || url.searchParams.get('mode') === 'bytes') throw new AppError('사진 링크를 갱신해 주세요.', 403);
+        if (isPreview || ['bytes', 'download'].includes(url.searchParams.get('mode'))) throw new AppError('사진 링크를 갱신해 주세요.', 403);
         if (photo.source === 'share' && httpsUrl(photo.url)) return redirect(httpsUrl(photo.url));
         const path = photo.source === 'share' ? `/shares/${shareToken(env)}/items/${encodeURIComponent(photo.id)}` : `/me/drive/items/${encodeURIComponent(photo.id)}`;
         const item = await graph(path, env);

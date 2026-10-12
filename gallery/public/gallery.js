@@ -34,6 +34,14 @@
   }
   const heicCache = new Map(), temporaryURLs = new Set();
   let conversionController, conversionWorker, conversionTimer;
+  let actionController, shareFile = null, shareBusy = false, downloadVersion = 0;
+  function actionStatus(text) { $('action-status').textContent = text; $('action-status').hidden = !text; }
+  function resetActions() {
+    actionController?.abort(); actionController = null; shareFile = null; shareBusy = false; ++downloadVersion;
+    $('download').disabled = false; $('download').textContent = '다운로드 ↓';
+    $('share').disabled = selected?.kind !== 'photo'; $('share').textContent = '공유 ↗';
+    actionStatus('');
+  }
   const photoTimers = new Set();
   const thumbnailWaiters = new Map(), thumbnailActive = new Set();
   function pumpThumbnails() {
@@ -297,10 +305,10 @@
       const key = heicCache.keys().next().value; URL.revokeObjectURL(heicCache.get(key).url); heicCache.delete(key);
     }
   }
-  async function downloadHeic(url, signal) {
+  async function fetchOriginalBlob(url, signal, fallbackType = 'image/heic') {
     const target = new URL(url, location.href); target.searchParams.set('mode', 'bytes');
     const response = await fetch(target, { cache: 'no-store', signal });
-    if (!response.ok) throw new Error('download');
+    if (!response.ok) throw new Error(response.status === 413 ? 'too-large' : 'download');
     const reader = response.body.getReader(), chunks = []; let size = 0;
     try {
       while (true) {
@@ -311,7 +319,7 @@
       }
     } finally { reader.releaseLock(); }
     if (!size) throw new Error('download');
-    return new Blob(chunks, { type: response.headers.get('Content-Type') || 'image/heic' });
+    return new Blob(chunks, { type: response.headers.get('Content-Type') || fallbackType });
   }
   async function convertHeic(blob, signal) {
     const buffer = await blob.arrayBuffer();
@@ -334,6 +342,7 @@
   async function show(index) {
     if (!viewer.open || index < 0 || index >= visible.length) return;
     cancelPhotoLoads(); resetVideo(); current = index; selected = visible[index];
+    resetActions();
     const item = selected, version = ++showVersion, isVideo = item.kind === 'video';
     $('photo-loading').hidden = isVideo; $('photo-loading').textContent = isVideo ? '영상을 불러오는 중…' : '사진을 불러오는 중…'; $('photo-error').hidden = true;
     image.removeAttribute('src'); image.alt = item.name; image.hidden = true;
@@ -398,10 +407,10 @@
           let phase = 'download';
           try {
             let blob;
-            try { blob = await downloadHeic(item.original, control.signal); }
+            try { blob = await fetchOriginalBlob(item.original, control.signal); }
             catch (error) {
               if (!active() || control.signal.aborted || error.message === 'too-large') throw error;
-              blob = await downloadHeic(await freshOriginal(item.id, control.signal), control.signal);
+              blob = await fetchOriginalBlob(await freshOriginal(item.id, control.signal), control.signal);
             }
             if (!active()) return;
             const nativeURL = URL.createObjectURL(blob); temporaryURLs.add(nativeURL);
@@ -465,6 +474,80 @@
     try { const url = await freshOriginal(); if (tab) tab.location.href = url; else window.location.assign(url); }
     catch { if (tab) tab.close(); $('announcement').textContent = '원본을 열지 못했습니다. 목록을 새로고침해 주세요.'; }
   };
+  $('download').onclick = async () => {
+    if (!selected) return;
+    const id = selected.id, version = ++downloadVersion;
+    $('download').disabled = true; $('download').textContent = '준비 중…';
+    actionStatus('원본 다운로드를 준비하고 있어요.');
+    try {
+      const url = new URL(await freshOriginal(id), location.href);
+      if (version !== downloadVersion || !viewer.open) return;
+      url.searchParams.set('mode', 'download');
+      const link = document.createElement('a'); link.href = url.href; link.download = selected.name || 'original';
+      viewer.append(link); link.click(); link.remove();
+      actionStatus('원본 다운로드를 요청했어요. 브라우저의 다운로드 목록이나 파일 앱에서 확인해 주세요.');
+    } catch {
+      if (version === downloadVersion) actionStatus('다운로드를 준비하지 못했어요. 다시 눌러 주세요.');
+    } finally {
+      if (version === downloadVersion) { $('download').disabled = false; $('download').textContent = '다운로드 ↓'; }
+    }
+  };
+  function shareType(item, blob) {
+    const extension = item.name?.split('.').at(-1).toLowerCase();
+    const known = {heic:'image/heic',heif:'image/heif',jpg:'image/jpeg',jpeg:'image/jpeg',png:'image/png',gif:'image/gif',webp:'image/webp',avif:'image/avif',tif:'image/tiff',tiff:'image/tiff'};
+    return known[extension] || blob.type;
+  }
+  $('share').onclick = async () => {
+    if (!selected || selected.kind !== 'photo' || shareBusy) return;
+    if (typeof navigator.share !== 'function' || typeof navigator.canShare !== 'function') {
+      actionStatus('이 브라우저는 원본 파일 공유를 지원하지 않아요. 다운로드한 원본을 파일 앱에서 공유해 주세요.'); return;
+    }
+    const item = selected, version = showVersion, control = new AbortController(); actionController = control;
+    let timer;
+    shareBusy = true; $('share').disabled = true;
+    try {
+      if (!shareFile) {
+        $('share').textContent = '준비 중…'; actionStatus('공유할 원본 파일을 준비하고 있어요.');
+        timer = setTimeout(() => control.abort(), 60000);
+        let blob;
+        try { blob = await fetchOriginalBlob(item.original, control.signal, 'application/octet-stream'); }
+        catch (error) {
+          if (control.signal.aborted || error.message === 'too-large') throw error;
+          blob = await fetchOriginalBlob(await freshOriginal(item.id, control.signal), control.signal, 'application/octet-stream');
+        }
+        if (control.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+        if (version !== showVersion || !viewer.open) return;
+        shareFile = new File([blob], item.name || 'original', {type:shareType(item,blob)});
+        clearTimeout(timer);
+      }
+      const data = {files:[shareFile]};
+      if (!navigator.canShare(data)) {
+        actionStatus('이 기기에서는 이 원본 형식을 공유할 수 없어요. 다운로드한 원본을 파일 앱에서 공유해 주세요.'); return;
+      }
+      // iOS and Android can consume transient activation while fetching a large file.
+      // Retain the exact original and ask for a fresh tap instead of sharing a URL or JPEG preview.
+      if (navigator.userActivation && !navigator.userActivation.isActive) {
+        $('share').textContent = '공유하기 ↗'; actionStatus('원본이 준비됐어요. 공유하기를 한 번 더 눌러 주세요.'); return;
+      }
+      $('share').textContent = '공유 ↗';
+      await navigator.share(data);
+      if (version === showVersion && viewer.open) actionStatus('');
+    } catch (error) {
+      if (version !== showVersion || !viewer.open) return;
+      if (error.name === 'NotAllowedError' && shareFile) {
+        $('share').textContent = '공유하기 ↗'; actionStatus('공유하기를 다시 눌러 주세요. 계속 열리지 않으면 다운로드한 원본을 파일 앱에서 공유해 주세요.');
+      } else if (error.name === 'AbortError' && !control.signal.aborted) {
+        actionStatus('');
+      } else {
+        $('share').textContent = '공유 ↗';
+        actionStatus(error.message === 'too-large' ? '큰 원본은 먼저 다운로드한 뒤 파일 앱에서 공유해 주세요.' : '원본 공유를 준비하지 못했어요. 다시 누르거나 다운로드해 주세요.');
+      }
+    } finally {
+      clearTimeout(timer);
+      if (version === showVersion) { shareBusy = false; $('share').disabled = false; if ($('share').textContent === '준비 중…') $('share').textContent = '공유 ↗'; }
+      if (actionController === control) actionController = null;
+    }
+  };
   $('like').onclick = async () => {
     if (!selected) return;
     const id = selected.id, oldIndex = current;
@@ -497,7 +580,7 @@
   };
   viewer.addEventListener('cancel', () => video.pause());
   viewer.addEventListener('close', () => {
-    ++showVersion; cancelPhotoLoads(); resetVideo(); image.removeAttribute('src'); resumeThumbnails();
+    ++showVersion; cancelPhotoLoads(); resetActions(); resetVideo(); image.removeAttribute('src'); resumeThumbnails();
     const focus = lastFocused?.isConnected ? lastFocused : [...document.querySelectorAll('.card')].find(button => button.dataset.photoId === selected?.id) || $('all'); focus?.focus({preventScroll:true});
   });
   viewer.addEventListener('keydown', event => {

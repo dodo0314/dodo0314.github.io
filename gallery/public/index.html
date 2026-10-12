@@ -29,7 +29,7 @@
     <div class="viewer-top"><span id="counter"></span><div class="viewer-tools"><button id="home" aria-label="메인 갤러리로" title="메인 갤러리로"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 10 9-7 9 7M5 9v12h5v-7h4v7h5V9"/></svg></button><button id="like" aria-label="사진 좋아하기" aria-pressed="false">♡</button></div></div>
     <div id="stage" class="stage"><img id="photo" alt=""><video id="video" controls playsinline preload="none" hidden></video><div id="photo-loading" class="photo-loading" hidden>불러오는 중…</div><div id="photo-error" class="photo-error" hidden><p id="media-error-text">사진을 불러오지 못했어요.</p><button id="photo-retry">다시 시도</button></div></div>
     <button id="previous" class="nav previous" aria-label="이전 사진">‹</button><button id="next" class="nav next" aria-label="다음 사진">›</button>
-    <div class="viewer-bottom"><div><span id="photo-date"></span><span id="date-source"></span><span id="quality-status" role="status"></span><span id="photo-name"></span></div><button id="original">원본 열기 ↗</button></div>
+    <div class="viewer-bottom"><div class="photo-details"><span id="photo-date"></span><span id="date-source"></span><span id="quality-status" role="status"></span><span id="photo-name"></span></div><div class="original-actions"><button id="original">원본 열기 ↗</button><button id="download" aria-label="원본 다운로드">다운로드 ↓</button><button id="share" aria-label="원본 이미지 공유">공유 ↗</button></div><p id="action-status" role="status" hidden></p></div>
     <span id="announcement" class="sr-only" aria-live="polite"></span>
   </dialog>
   <script>/* GALLERY_JS */</script>

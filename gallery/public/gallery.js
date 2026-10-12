@@ -49,6 +49,7 @@
     $('download').setAttribute('aria-busy',String(!downloadFallback && !shareFile));
     $('share').disabled = !photo || !ready || shareBusy;
     $('copy').disabled = !photo || !originalReady || !image.complete || !image.naturalWidth || !supportsImageCopy() || copyBusy;
+    $('copy-small').disabled = $('copy').disabled;
     $('copy').textContent = !supportsImageCopy() ? '이미지 복사 미지원' : copyBusy ? '복사 중…' : '이미지 복사(PNG)';
   }
   function resetActions() {
@@ -537,31 +538,70 @@
   }
   $('download').onclick = () => downloadFallback ? downloadFile() : shareOriginal('save');
   $('share').onclick = () => shareOriginal();
-  $('copy').onclick = async () => {
+  async function clipboardPNG(src, sourceWidth, sourceHeight, version, resources, maxSide) {
+    const active = () => version === showVersion && viewer.open && !resources.cancelled;
+    const source = resources.source = new Image(); source.decoding = 'sync'; source.src = src;
+    await source.decode();
+    if (!active()) throw new DOMException('Cancelled','AbortError');
+    if (source.naturalWidth !== sourceWidth || source.naturalHeight !== sourceHeight) throw new Error('image-changed');
+    const scale = Math.min(1,maxSide / Math.max(sourceWidth,sourceHeight));
+    const width = Math.max(1,Math.round(sourceWidth * scale)), height = Math.max(1,Math.round(sourceHeight * scale));
+    const canvas = resources.canvas = document.createElement('canvas'); canvas.width = width; canvas.height = height;
+    // Use an opaque sRGB backing store and flush sampled pixels before encoding.
+    const context = canvas.getContext('2d',{alpha:false,colorSpace:'srgb',willReadFrequently:true});
+    if (!context) throw new Error('canvas');
+    context.fillStyle = '#fff'; context.fillRect(0,0,width,height); context.drawImage(source,0,0,width,height);
+    const points = [[.1,.1],[.5,.5],[.9,.9],[.1,.9],[.9,.1]].map(([x,y]) => [Math.min(width-1,Math.floor(x*width)),Math.min(height-1,Math.floor(y*height))]);
+    const expected = points.map(([x,y]) => [...context.getImageData(x,y,1,1).data]);
+    const blob = await new Promise((resolve,reject) => canvas.toBlob(value => value ? resolve(value) : reject(new Error('encode')),'image/png'));
+    if (!active()) throw new DOMException('Cancelled','AbortError');
+    const bytes = new Uint8Array(await blob.slice(0,33).arrayBuffer());
+    if (blob.type !== 'image/png' || bytes.length !== 33 || [137,80,78,71,13,10,26,10].some((value,index) => bytes[index] !== value)) throw new Error('invalid-png');
+    const header = new DataView(bytes.buffer);
+    if (header.getUint32(16) !== width || header.getUint32(20) !== height) throw new Error('invalid-png');
+    const check = resources.check = new Image();
+    const url = resources.url = URL.createObjectURL(blob); check.src = url; await check.decode();
+    if (!active()) throw new DOMException('Cancelled','AbortError');
+    if (check.naturalWidth !== width || check.naturalHeight !== height) throw new Error('invalid-png');
+    const sample = resources.sample = document.createElement('canvas'); sample.width = sample.height = 1;
+    const sampling = sample.getContext('2d',{alpha:false,colorSpace:'srgb',willReadFrequently:true});
+    if (!sampling) throw new Error('canvas');
+    for (let index = 0; index < points.length; index++) {
+      const [x,y] = points[index]; sampling.drawImage(check,x,y,1,1,0,0,1,1);
+      const actual = sampling.getImageData(0,0,1,1).data;
+      if (expected[index].some((value,channel) => Math.abs(value-actual[channel]) > 3)) throw new Error('invalid-png');
+    }
+    // Retain the source canvas until clipboard.write() finishes; release the verification image now.
+    check.removeAttribute('src'); URL.revokeObjectURL(url); resources.url = null;
+    return blob;
+  }
+  async function copyImage(maxSide = Infinity) {
     if (!viewer.open || !originalReady || !image.complete || !image.naturalWidth || copyBusy || !supportsImageCopy()) return;
     const version = showVersion;
     copyBusy = true; updateActions(); actionStatus('붙여넣기용 이미지를 복사하고 있어요.');
-    let canvas;
+    const resources = {};
+    let png;
     try {
       if (image.naturalWidth * image.naturalHeight > 50000000) throw new Error('too-large');
-      canvas = document.createElement('canvas'); canvas.width = image.naturalWidth; canvas.height = image.naturalHeight;
-      const context = canvas.getContext('2d'); if (!context) throw new Error('canvas');
-      context.drawImage(image,0,0);
-      const png = new Promise((resolve,reject) => canvas.toBlob(blob => {
-        canvas.width = canvas.height = 1;
-        if (version !== showVersion || !viewer.open) reject(new DOMException('Cancelled','AbortError'));
-        else if (!blob) reject(new Error('encode'));
-        else resolve(blob);
-      },'image/png'));
+      png = clipboardPNG(image.currentSrc || image.src,image.naturalWidth,image.naturalHeight,version,resources,maxSide);
       // Safari needs clipboard.write() in the click task. Pass the future PNG as a Promise.
       png.catch(() => {});
-      await navigator.clipboard.write([new ClipboardItem({'image/png':png})]);
-      if (version === showVersion && viewer.open) actionStatus('PNG 이미지를 복사했어요. 메신저에서 붙여넣어 주세요. 원본 해상도를 유지하며 HEIC 형식·EXIF는 포함하지 않아요. 붙여넣기 지원은 받는 앱에 따라 달라요.');
+      await navigator.clipboard.write([new ClipboardItem({'image/png':png},{presentationStyle:'inline'})]);
+      if (version === showVersion && viewer.open) actionStatus(maxSide === Infinity ? '검증한 PNG를 복사했어요. 원본 해상도를 유지하며 HEIC 형식·EXIF는 포함하지 않아요. 전송이 실패하면 메신저용 복사나 원본 공유를 사용해 주세요.' : '메신저용 PNG를 복사했어요. 긴 쪽은 최대 2048px이며 HEIC 형식·EXIF는 포함하지 않아요. 메신저에서 붙여넣어 주세요.');
     } catch (error) {
       if (version !== showVersion || !viewer.open) return;
       actionStatus(error.message === 'too-large' ? '이 이미지는 복사하기에 너무 커요. 원본 공유를 사용해 주세요.' : '이 브라우저에서 이미지 복사를 완료하지 못했어요. 원본 공유를 사용해 주세요.');
-    } finally { if (version === showVersion) { copyBusy = false; updateActions(); } }
-  };
+    } finally {
+      resources.cancelled = true;
+      await png?.catch(() => {});
+      resources.source?.removeAttribute('src'); resources.check?.removeAttribute('src');
+      if (resources.url) URL.revokeObjectURL(resources.url);
+      for (const canvas of [resources.canvas,resources.sample]) if (canvas) canvas.width = canvas.height = 1;
+      if (version === showVersion) { copyBusy = false; updateActions(); }
+    }
+  }
+  $('copy').onclick = () => copyImage();
+  $('copy-small').onclick = () => copyImage(2048);
   $('like').onclick = async () => {
     if (!selected) return;
     const id = selected.id, oldIndex = current;

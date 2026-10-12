@@ -768,7 +768,7 @@
       const now = performance.now(), done = shown != null && cards.every(sharp);
       if (!done && now < 60000) { box.textContent = '첫 화면 ' + cards.length + '칸 측정 중…' + (shown == null ? '' : ' 다 뜸 ' + seconds(shown)); return; }
       clearInterval(timer);
-      const sources = {}, names = {stored:'저장 링크',renewed:'목록 갱신',retry:'거절 뒤 갱신',cached:'갱신된 링크'};
+      const sources = {}, names = {stored:'저장 링크',item:'사진별 갱신',renewed:'목록 갱신',retry:'거절 뒤 갱신',cached:'갱신된 링크'};
       for (const entry of performance.getEntriesByType('resource')) {
         if (!/^\/api\/(grid|preview)\//.test(new URL(entry.name).pathname)) continue;
         // Safari may not report transfer sizes, so a server send time older than this page also means the cache.

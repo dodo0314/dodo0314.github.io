@@ -512,6 +512,7 @@ test('expired thumbnail and preview links renew together through their recorded 
       return Response.json({value:[{id:'photo-one',name:'one.heic',file:{mimeType:'image/heic'},'@microsoft.graph.downloadUrl':'https://photos.example/original.heic',
         thumbnails:[{medium:{url:`https://photos.example/${pageReads === 1 ? 'expired' : 'renewed'}-thumb.jpg`},large:{url:`https://photos.example/${pageReads === 1 ? 'expired' : 'renewed'}-preview.jpg`}}]}]});
     }
+    if (url.endsWith('/thumbnails')) return new Response(null,{status:400}); // per-photo lookup unsupported: page renewal
     assert.equal(url.startsWith('https://photos.example/'),true);
     assert.equal(init.headers?.Authorization,undefined); assert.equal(init.headers?.Cookie,undefined);
     bytes++;
@@ -549,6 +550,7 @@ test('legacy snapshots seek newer filenames, fall back for unsupported ordering 
       return Response.json({value:[{id:'photo-one',name:'20261010_104347967_iOS.heic',file:{mimeType:'image/heic'},thumbnails:[{large:{url:`https://photos.example/${pageReads === 1 ? 'expired' : 'preview'}.jpg`}}]}],
         ...(pageReads > 1 ? {'@odata.nextLink':'https://graph.microsoft.com/v1.0/me/drive/items/owner-album/children?unused=1'} : {})});
     }
+    if (url.endsWith('/thumbnails')) return new Response(null,{status:400}); // per-photo lookup unsupported: album walk
     if (url==='https://photos.example/expired.jpg') return new Response(null,{status:401});
     if (url==='https://photos.example/preview.jpg') return new Response('jpeg',{headers:{'Content-Type':'image/jpeg'}});
     throw Error('Do not enumerate unrelated later pages');
@@ -600,6 +602,7 @@ test('legacy album page hints survive cold Workers and never persist file URLs o
         '@microsoft.graph.downloadUrl':'https://photos.example/private-original.heic',thumbnails:[{large:{url:`https://photos.example/${saving ? 'expired' : 'private'}-preview.jpg`}}]}],
         ...(!last ? {'@odata.nextLink':'https://graph.microsoft.com/v1.0/me/drive/items/owner-album/children?page=' + (url.includes('page=2') ? 3 : 2)} : {})});
     }
+    if (url.endsWith('/thumbnails')) return new Response(null,{status:400}); // per-photo lookup unsupported: saved page hints
     if (url.startsWith('https://photos.example/expired-')) return new Response(null,{status:401});
     if (url.startsWith('https://photos.example/')) return new Response('jpeg',{headers:{'Content-Type':'image/jpeg'}});
     throw Error('Unexpected hint fixture request');
@@ -697,43 +700,60 @@ test('grid links stay identical within a window, expire within a day and never o
   assert.equal((await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/grid/'+media),env)).status,403);
 });
 
-test('old saved preview links are tried before renewal, and one refusal stops the attempts in that Worker', async () => {
-  for (const expired of [false,true]) {
-    const env = {...environment(),MS_CLIENT_ID:'stored-first-'+expired};
-    let phase = 'saved'; const reads = [], downloads = [];
-    globalThis.fetch = async input => {
+test('previews of an old list renew just their own photo, without album pages or expired saved links', async () => {
+  for (const supported of [true,false]) {
+    const env = {...environment(),MS_CLIENT_ID:'per-photo-'+supported};
+    let phase = 'saved'; const reads = [], downloads = [], lookups = [];
+    globalThis.fetch = async (input,init) => {
       const url = String(input);
-      if (url.includes('/oauth2/v2.0/token')) return Response.json({access_token:'stored-token',refresh_token:'stored-refresh',expires_in:3600});
+      if (url.includes('/oauth2/v2.0/token')) return Response.json({access_token:'item-token',refresh_token:'item-refresh',expires_in:3600});
       if (url.endsWith('/owner-album')) return Response.json({id:'owner-album'});
-      if (url.includes('children')) {
-        reads.push(url); const second = url.includes('page=2'), id = second ? 'photo-b' : 'photo-a';
-        return Response.json({value:[{id,name:id+'.jpg',file:{mimeType:'image/jpeg'},photo:{takenDateTime:second ? '2026-01-02T00:00:00Z' : '2026-01-01T00:00:00Z'},
-          thumbnails:[{medium:{url:`https://photos.example/${phase}-${id}-thumb.jpg`},large:{url:`https://photos.example/${phase}-${id}.jpg`}}]}],
-          ...(second ? {} : {'@odata.nextLink':'https://graph.microsoft.com/v1.0/me/drive/items/owner-album/children?page=2'})});
+      const lookup = /\/me\/drive\/items\/(photo-[abc])\/thumbnails$/.exec(url);
+      if (lookup) {
+        assert.equal(init.headers.Authorization,'Bearer item-token');
+        lookups.push(lookup[1]);
+        if (!supported) return new Response(null,{status:400});
+        // photo-a's first link has already expired; its retry gets a working one.
+        const name = lookup[1] === 'photo-a' && lookups.filter(id => id === 'photo-a').length === 1 ? 'expired' : 'item';
+        return Response.json({value:[{id:'0',medium:{url:`https://photos.example/${name}-${lookup[1]}-thumb.jpg`},large:{url:`https://photos.example/${name}-${lookup[1]}.jpg`}}]});
       }
+      if (url.includes('children')) {
+        reads.push(url); const page = Number(new URL(url).searchParams.get('page') || 1), id = 'photo-' + 'abc'[page - 1];
+        return Response.json({value:[{id,name:id+'.jpg',file:{mimeType:'image/jpeg'},photo:{takenDateTime:`2026-01-0${page}T00:00:00Z`},
+          thumbnails:[{medium:{url:`https://photos.example/${phase}-${id}-thumb.jpg`},large:{url:`https://photos.example/${phase}-${id}.jpg`}}]}],
+          ...(page < 3 ? {'@odata.nextLink':'https://graph.microsoft.com/v1.0/me/drive/items/owner-album/children?page='+(page+1)} : {})});
+      }
+      assert.equal(init.headers?.Authorization,undefined,'file hosts never receive the owner token');
       downloads.push(url);
-      return expired && url.includes('/saved-') ? new Response(null,{status:401}) : new Response('jpeg',{headers:{'Content-Type':'image/jpeg'}});
+      return /\/(saved|expired)-/.test(url) ? new Response(null,{status:401}) : new Response('jpeg',{headers:{'Content-Type':'image/jpeg'}});
     };
     const list = await (await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album?sort=old'),env)).json();
     phase = 'renewed'; const built = reads.length;
-    // A list saved six hours ago: older than the 15 minutes after which links used to be renewed first.
+    // A list saved six hours ago: its saved links are past the 15-minute window.
     const old = {...env,GALLERY_KV:{...env.GALLERY_KV,async get(key,type) {
       const value = await env.GALLERY_KV.get(key,type);
       return key.startsWith('album:') && type === 'json' && value ? {...value,updatedAt:new Date(Date.now()-6*3600000).toISOString()} : value;
     }}};
-    const [a,b] = list.items;
-    const first = await worker.fetch(new Request(env.PUBLIC_ORIGIN+a.preview),old);
-    assert.equal(first.status,200);
-    if (!expired) {
-      assert.match(first.headers.get('Server-Timing'),/link;desc="stored", total;dur=\d+, sent;desc="\d{13}"/);
-      assert.equal(reads.length,built,'a working saved link needs no album page read');
+    const [a,b,c] = list.items;
+    const timing = res => /link;desc="([a-z]+)"/.exec(res.headers.get('Server-Timing'))?.[1];
+    const thumbA = await worker.fetch(new Request(env.PUBLIC_ORIGIN+a.thumbnail),old);
+    assert.equal(thumbA.status,200);
+    assert.equal(downloads.some(url => url.includes('/saved-')),false,'saved links past 15 minutes are not tried');
+    if (supported) {
+      assert.equal(timing(thumbA),'retry','an expired per-photo link is looked up once more');
+      assert.equal(reads.length,built,'no album page is read');
+      const previewA = await worker.fetch(new Request(env.PUBLIC_ORIGIN+a.preview),old);
+      assert.equal(previewA.status,200); assert.equal(timing(previewA),'cached','the large preview reuses the same lookup');
+      const thumbB = await worker.fetch(new Request(env.PUBLIC_ORIGIN+b.thumbnail),old);
+      assert.equal(thumbB.status,200); assert.equal(timing(thumbB),'item');
+      assert.deepEqual(lookups,['photo-a','photo-a','photo-b']); assert.equal(reads.length,built);
       continue;
     }
-    assert.match(first.headers.get('Server-Timing'),/link;desc="retry"/);
-    assert.equal(reads.length,built+1,'the refused link renews only its own page');
-    const second = await worker.fetch(new Request(env.PUBLIC_ORIGIN+b.preview),old);
-    assert.equal(second.status,200); assert.match(second.headers.get('Server-Timing'),/link;desc="renewed"/);
-    assert.equal(downloads.filter(url => url.includes('/saved-')).length,1,'after one refusal the other saved links are skipped');
+    assert.equal(timing(thumbA),'renewed'); assert.equal(reads.length,built+1,'an unsupported lookup falls back to the photo\'s album page');
+    assert.equal((await worker.fetch(new Request(env.PUBLIC_ORIGIN+b.thumbnail),old)).status,200);
+    assert.deepEqual(lookups,['photo-a','photo-b']);
+    assert.equal((await worker.fetch(new Request(env.PUBLIC_ORIGIN+c.thumbnail),old)).status,200);
+    assert.deepEqual(lookups,['photo-a','photo-b'],'after two failures this Worker stops trying per-photo lookups');
   }
 });
 
@@ -764,4 +784,26 @@ test('a Worker keeps its parsed album list while a small revision key says it is
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(fullReads,2); assert.equal(await get(albumKey+':revision'),first.revision,'a list saved before this version gets its revision key');
   } finally { mock.timers.reset(); }
+});
+
+test('a per-photo lookup is refused when the owner connection changes while it runs', async () => {
+  const env = {...environment(),MS_CLIENT_ID:'per-photo-owner'}; const downloads = [];
+  globalThis.fetch = async input => {
+    const url = String(input);
+    if (url.includes('/oauth2/v2.0/token')) return Response.json({access_token:'owner-token',refresh_token:'owner-refresh',expires_in:3600});
+    if (url.endsWith('/owner-album')) return Response.json({id:'owner-album'});
+    if (url.includes('children')) return Response.json({value:[{id:'photo-one',name:'one.jpg',file:{mimeType:'image/jpeg'},thumbnails:[{medium:{url:'https://photos.example/saved.jpg'}}]}]});
+    if (url.endsWith('/photo-one/thumbnails')) {
+      await env.GALLERY_KV.put('connection',JSON.stringify({refreshToken:'another-owner',connectionId:'another-connection'}));
+      return Response.json({value:[{medium:{url:'https://photos.example/other-owner.jpg'}}]});
+    }
+    downloads.push(url); return new Response('jpeg',{headers:{'Content-Type':'image/jpeg'}});
+  };
+  const list = await (await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).json();
+  const old = {...env,GALLERY_KV:{...env.GALLERY_KV,async get(key,type) {
+    const value = await env.GALLERY_KV.get(key,type);
+    return key.startsWith('album:') && type === 'json' && value ? {...value,updatedAt:new Date(Date.now()-6*3600000).toISOString()} : value;
+  }}};
+  assert.equal((await worker.fetch(new Request(env.PUBLIC_ORIGIN+list.items[0].thumbnail),old)).status,403);
+  assert.deepEqual(downloads,[]);
 });

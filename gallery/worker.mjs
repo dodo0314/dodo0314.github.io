@@ -15,7 +15,7 @@ const albumStates = new WeakMap();
 const SNAPSHOT_VERSION = 3;
 const PAGE_SIZE = 60;
 const SNAPSHOT_REFRESH_MS = 15 * 60000;
-const BUILD_ID = '2026-10-12-invite-fast-grid-v10.1';
+const BUILD_ID = '2026-10-12-invite-fast-grid-v11';
 // Grid image links stay identical for a 12-hour window so the browser cache can reuse them.
 // Windows turn over at 04:00 and 16:00 KST, away from evening viewing; a link lives 12–24 hours.
 const GRID_WINDOW_MS = 12 * 3600000;
@@ -401,6 +401,23 @@ function mediaLinks(item, listingPath) {
     thumbnail:httpsUrl(thumbs.medium?.url || thumbs.small?.url || thumbs.large?.url),
     preview:httpsUrl(thumbs.large?.url || thumbs.medium?.url || thumbs.small?.url), listingPath };
 }
+function itemPath(env, record) {
+  return record.driveId ? `/drives/${encodeURIComponent(record.driveId)}/items/${encodeURIComponent(record.id)}` : record.source === 'share'
+    ? `/shares/${shareToken(env)}/items/${encodeURIComponent(record.id)}` : `/me/drive/items/${encodeURIComponent(record.id)}`;
+}
+// One photo's current thumbnail links, without reading the 200-item album page it sits on.
+// The small and large requests for the same photo share one lookup.
+function itemThumbnails(env, state, record) {
+  if (!state.itemLinks.has(record.id)) {
+    const pending = graph(itemPath(env, record) + '/thumbnails', env).then(data => {
+      const set = data?.value?.[0] || {};
+      return { thumbnail: httpsUrl(set.medium?.url || set.small?.url || set.large?.url), preview: httpsUrl(set.large?.url || set.medium?.url || set.small?.url) };
+    });
+    state.itemLinks.set(record.id, pending);
+    pending.catch(() => { if (state.itemLinks.get(record.id) === pending) state.itemLinks.delete(record.id); });
+  }
+  return state.itemLinks.get(record.id);
+}
 async function checkLinkOwner(env, snapshot) {
   const connection = await readConnection(env, 'json');
   if (!connection?.refreshToken || connectionId(connection) !== snapshot.connectionId || await albumKey(env) !== snapshot.key) {
@@ -410,7 +427,7 @@ async function checkLinkOwner(env, snapshot) {
 function linksState(env, snapshot) {
   const state = albumState(env), scope = snapshot.key + ':' + snapshot.connectionId;
   if (state.links?.scope !== scope || state.links.revision !== snapshot.revision || Date.now() - state.links.startedAt >= SNAPSHOT_REFRESH_MS) {
-    state.links = {scope,revision:snapshot.revision,startedAt:Date.now(),records:new Map(),allowed:new Set(snapshot.items.map(item => item.id)),pages:new Map(),hints:new Map(),hintPages:new Map(),next:null,initialized:false,count:0};
+    state.links = {scope,revision:snapshot.revision,startedAt:Date.now(),records:new Map(),allowed:new Set(snapshot.items.map(item => item.id)),pages:new Map(),hints:new Map(),hintPages:new Map(),next:null,initialized:false,count:0,itemLinks:new Map(),itemFailures:0};
   }
   return state.links;
 }
@@ -623,21 +640,32 @@ export default {
           if (!record) throw new AppError('이 순간은 현재 앨범에 없습니다.', 404);
           const snapshotAge = Date.now() - Date.parse(snapshot.updatedAt);
           const targetOf = links => isPreview ? url.searchParams.get('size') === 'thumb' ? links.thumbnail || links.preview : links.preview || links.thumbnail : links.downloadUrl;
-          let link = 'renewed', usedStored = false;
+          let link = 'renewed';
           const resolve = async (force = false) => {
             const state = linksState(env,snapshot);
+            if (force && isPreview) state.itemLinks.delete(record.id);
             const cached = state.records.get(record.id);
             if (!force && targetOf(cached || {})) { link = 'cached'; return targetOf(cached); }
-            // Preview links in the saved list often outlive 15 minutes, while renewing reads a whole
-            // 200-item album page. Try them first; the first refusal stops this for the list in this Worker.
-            const storedUsable = isPreview ? !state.storedRefused : snapshotAge >= 0 && snapshotAge < SNAPSHOT_REFRESH_MS;
-            if (!force && url.searchParams.get('fresh') !== '1' && storedUsable && targetOf(record)) { link = 'stored'; usedStored = true; return targetOf(record); }
+            // Saved links are used only while the list is under 15 minutes old: measured visits found
+            // older saved preview links already refused by OneDrive.
+            if (!force && url.searchParams.get('fresh') !== '1' && snapshotAge >= 0 && snapshotAge < SNAPSHOT_REFRESH_MS && targetOf(record)) { link = 'stored'; return targetOf(record); }
             link = force ? 'retry' : 'renewed';
+            if (isPreview && state.itemFailures < 2) {
+              const known = state.itemLinks.has(record.id);
+              let links = null;
+              // Two failed lookups mean this album's items do not support it; renew by album page instead.
+              try { links = await itemThumbnails(env, state, record); } catch { state.itemFailures++; }
+              if (links && targetOf(links)) {
+                await checkLinkOwner(env, snapshot);
+                // A refused page-read link is dropped only now; page renewal below still needs it otherwise.
+                if (force) state.records.delete(record.id);
+                else link = known ? 'cached' : 'item';
+                return targetOf(links);
+              }
+            }
             if (!isPreview) {
-              const path = record.driveId ? `/drives/${encodeURIComponent(record.driveId)}/items/${encodeURIComponent(record.id)}` : record.source === 'share'
-                ? `/shares/${shareToken(env)}/items/${encodeURIComponent(record.id)}` : `/me/drive/items/${encodeURIComponent(record.id)}`;
               try {
-                const item = await graph(path, env);
+                const item = await graph(itemPath(env, record), env);
                 if (isMedia(item) && targetOf(mediaLinks(item))) return targetOf(mediaLinks(item));
               } catch (error) { if (![400,403,404].includes(error.upstreamStatus)) throw error; }
             }
@@ -652,7 +680,6 @@ export default {
           try { return await deliver(await resolve()); }
           catch (error) {
             if (![401,403,404,410].includes(error.originalStatus)) throw error;
-            if (usedStored && isPreview) linksState(env,snapshot).storedRefused = true;
             return await deliver(await resolve(true));
           }
         }

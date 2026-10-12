@@ -46,8 +46,12 @@ try {
     await page.goto(base);
     await page.waitForFunction(() => document.querySelectorAll('.card img').length === 60 && [...document.querySelectorAll('.card img')].slice(0,3).every(img => img.complete && img.naturalWidth));
     assert.equal(originals.length,0, 'the grid must never download originals');
-    assert.equal(await page.locator('.card img').first().evaluate(img => img.naturalWidth),176);
-    assert.ok(previews.every(url => new URL(url,base).searchParams.get('size') === 'thumb'),'the grid should request small thumbnails, rather than large previews');
+    const initialWidth = await page.locator('.card img').first().evaluate(img => img.naturalWidth);
+    assert.ok(saveData ? initialWidth === 176 : [176,800].includes(initialWidth));
+    for (const url of previews.filter(value => new URL(value,base).searchParams.get('size') !== 'thumb')) {
+      const path = new URL(url,base).pathname;
+      assert.ok(previews.findIndex(value => new URL(value,base).pathname === path && new URL(value,base).searchParams.get('size') === 'thumb') < previews.indexOf(url),'each large grid preview follows its small thumbnail');
+    }
     // These assertions run in the click task itself, before any fresh image request can complete.
     const immediate = await page.evaluate(() => {
       const thumb = document.querySelector('.card img').currentSrc;

@@ -60,10 +60,63 @@
   image.addEventListener('load',updateActions);
   const photoTimers = new Set();
   const thumbnailWaiters = new Map(), thumbnailActive = new Set();
+  const thumbnailUpgrades = new Map();
+  let thumbnailUpgradeTimer;
+  const inViewport = element => {
+    const bounds = element.getBoundingClientRect();
+    return bounds.bottom > 0 && bounds.top < innerHeight && bounds.right > 0 && bounds.left < innerWidth;
+  };
+  function cancelThumbnailUpgrade(element) {
+    const upgrade = thumbnailUpgrades.get(element); if (!upgrade) return;
+    const waiting = thumbnailWaiters.get(element);
+    if (waiting) { ++waiting.upgradeGeneration; waiting.upgradeState = 'pending'; }
+    clearTimeout(upgrade.timer); upgrade.image.onload = upgrade.image.onerror = null; upgrade.image.removeAttribute('src');
+    thumbnailUpgrades.delete(element);
+  }
+  function scheduleThumbnailUpgrades() {
+    clearTimeout(thumbnailUpgradeTimer);
+    if (!saveData && !document.hidden && !viewer.open) thumbnailUpgradeTimer = setTimeout(pumpThumbnailUpgrades,150);
+  }
+  function pumpThumbnailUpgrades() {
+    if (saveData || document.hidden || viewer.open || thumbnailUpgrades.size || thumbnailActive.size >= 3) return;
+    if ([...thumbnailWaiters].some(([element,waiting]) => waiting.status !== 'done' && waiting.status !== 'failed' && inViewport(element))) return;
+    for (const [element,waiting] of thumbnailWaiters) {
+      if (waiting.status !== 'done' || waiting.full || waiting.upgradeState === 'failed' || waiting.upgradeState === 'done' || !element.isConnected || !inViewport(element)) continue;
+      const targetPixels = Math.ceil(waiting.button.clientWidth * Math.min(devicePixelRatio || 1,3));
+      if (Math.min(element.naturalWidth,element.naturalHeight) >= targetPixels || !waiting.item.preview || waiting.item.preview === waiting.item.thumbnail) continue;
+      const large = new Image(); large.alt = ''; large.decoding = 'async'; large.fetchPriority = 'low';
+      const generation = ++waiting.upgradeGeneration;
+      waiting.upgradeState = 'loading';
+      const upgrade = {image:large,timer:null}; thumbnailUpgrades.set(element,upgrade);
+      const active = () => thumbnailUpgrades.get(element) === upgrade && waiting.upgradeGeneration === generation && element.isConnected;
+      const finish = state => {
+        clearTimeout(upgrade.timer); large.onload = large.onerror = null;
+        if (thumbnailUpgrades.get(element) === upgrade) thumbnailUpgrades.delete(element);
+        waiting.upgradeState = state;
+      };
+      large.onload = async () => {
+        try { await large.decode(); }
+        catch { if (active()) { finish('failed'); pumpThumbnails(); } return; }
+        if (!active()) return;
+        if (document.hidden || viewer.open || !inViewport(element)) { cancelThumbnailUpgrade(element); pumpThumbnails(); return; }
+        finish('done');
+        if (Math.min(large.naturalWidth,large.naturalHeight) > Math.min(element.naturalWidth,element.naturalHeight)) {
+          thumbnailObserver?.unobserve(element); thumbnailWaiters.delete(element);
+          waiting.full = true; waiting.src = waiting.item.preview;
+          element.replaceWith(large); thumbnailWaiters.set(large,waiting); thumbnailObserver?.observe(large);
+          rememberPreview(waiting.item.id,large);
+        }
+        pumpThumbnails();
+      };
+      large.onerror = () => { if (active()) { finish('failed'); large.removeAttribute('src'); pumpThumbnails(); } };
+      upgrade.timer = setTimeout(() => large.onerror?.(),15000);
+      large.src = waiting.item.preview; break;
+    }
+  }
   function pumpThumbnails() {
     if (document.hidden || viewer.open) return;
     for (const [element, waiting] of thumbnailWaiters) {
-      if (thumbnailActive.size >= 3) break;
+      if (thumbnailActive.size + thumbnailUpgrades.size >= 3) break;
       if (!waiting.eligible || waiting.status !== 'queued' || !element.isConnected) continue;
       element.hidden = false;
       waiting.status = 'loading'; thumbnailActive.add(element);
@@ -74,6 +127,7 @@
       element.onload = () => {
         if (waiting.generation !== generation) return;
         finish(); waiting.status = 'done'; waiting.button.querySelector('.card-error')?.remove();
+        waiting.full = waiting.src === waiting.item.preview;
         if (!saveData) rememberPreview(waiting.item.id,element);
         pumpThumbnails();
       };
@@ -105,12 +159,13 @@
       };
       waiting.timer = setTimeout(() => element.onerror?.(),25000); element.src = waiting.src;
     }
+    scheduleThumbnailUpgrades();
   }
   const thumbnailObserver = 'IntersectionObserver' in window ? new IntersectionObserver(entries => {
     for (const entry of entries) {
       const waiting = thumbnailWaiters.get(entry.target); if (!waiting) continue;
       waiting.eligible = entry.isIntersecting;
-      if (!entry.isIntersecting) pauseThumbnail(entry.target);
+      if (!entry.isIntersecting) { pauseThumbnail(entry.target); cancelThumbnailUpgrade(entry.target); }
     }
     pumpThumbnails();
   }, {rootMargin:'180px'}) : null;
@@ -122,9 +177,12 @@
     thumbnailActive.delete(element);
   }
   function pauseThumbnails() {
+    clearTimeout(thumbnailUpgradeTimer);
+    for (const element of thumbnailUpgrades.keys()) cancelThumbnailUpgrade(element);
     for (const element of thumbnailActive) pauseThumbnail(element);
   }
   function stopThumbnailTimer(element) {
+    cancelThumbnailUpgrade(element);
     const waiting = thumbnailWaiters.get(element);
     if (waiting) { ++waiting.generation; clearTimeout(waiting.timer); waiting.control?.abort(); }
     element.onload = element.onerror = null; if (waiting?.status !== 'done') element.removeAttribute('src');
@@ -138,6 +196,10 @@
     }
     pumpThumbnails();
   }
+  for (const event of ['scroll','resize']) window.addEventListener(event,() => {
+    for (const element of thumbnailUpgrades.keys()) cancelThumbnailUpgrade(element);
+    scheduleThumbnailUpgrades();
+  },{passive:true});
   async function fetchJSON(url, init = {}, milliseconds = 15000) {
     const control = new AbortController(), abort = () => control.abort();
     if (init.signal?.aborted) control.abort(); else init.signal?.addEventListener('abort',abort,{once:true});
@@ -187,7 +249,7 @@
       const thumbnail = document.createElement('img'); thumbnail.alt = ''; thumbnail.decoding = 'async';
       if (index < 3) thumbnail.fetchPriority = 'high';
       button.append(thumbnail);
-      thumbnailWaiters.set(thumbnail,{item,button,src:item.thumbnail || item.preview,status:'queued',generation:0,eligible:!thumbnailObserver});
+      thumbnailWaiters.set(thumbnail,{item,button,src:item.thumbnail || item.preview,status:'queued',generation:0,upgradeGeneration:0,upgradeState:'pending',full:false,eligible:!thumbnailObserver});
       thumbnailObserver?.observe(thumbnail);
     } else {
       const error = document.createElement('span'); error.className = 'card-error'; error.textContent = item.kind === 'video' ? '영상 보기' : '사진 열기'; button.append(error);

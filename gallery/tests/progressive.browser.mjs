@@ -76,7 +76,7 @@ try {
           await page.waitForFunction(() => document.querySelector('.card img').naturalWidth === 800);
         } else {
           hold=false; await release();
-          if (mode === 'upgrade') { await page.waitForFunction(() => document.querySelector('.card img').naturalWidth === 800); assert.ok(maximum <= 3,'thumbnails and upgrades share the three-request limit'); }
+          if (mode === 'upgrade') { await page.waitForFunction(() => document.querySelector('.card img').naturalWidth === 800); assert.ok(maximum <= 6,'thumbnails and upgrades share the six-request limit'); }
           else { await page.waitForTimeout(700); assert.equal(await page.locator('.card img').first().evaluate(img => img.naturalWidth),176); assert.equal(await page.locator('.card-error').count(),0); }
         }
       }

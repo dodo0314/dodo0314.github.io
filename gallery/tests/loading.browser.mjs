@@ -46,7 +46,7 @@ try {
   await page.goto(base);
   await page.waitForFunction(() => [...document.querySelectorAll('.card img')].slice(0,3).every(img => img.naturalWidth));
   await page.waitForTimeout(800);
-  assert.ok(maximum <= 3,'the grid limits simultaneous image requests to three');
+  assert.ok(maximum > 3 && maximum <= 6,'the grid fills the screen with up to six simultaneous image requests, maximum '+maximum);
   assert.ok(previews < 25,'offscreen images must not saturate the connection');
   assert.equal(originals,0,'the grid never downloads original HEICs');
   assert.equal(await page.locator('#resume,#resume-button,.tab-symbol,#zoom,#play,#fullscreen,#close').count(),0);
@@ -99,7 +99,7 @@ try {
   await page.waitForFunction(() => ['original','converted'].includes(document.querySelector('#photo').dataset.quality));
   await page.locator('#home').click();
   assert.deepEqual(errors,[]);
-  console.log('PASS three-request viewport queue, grid and HEIC visibility recovery, bounded metadata retry, online recovery, no grid reload on like, two toolbar buttons, external period label, removed resume');
+  console.log('PASS six-request viewport queue, grid and HEIC visibility recovery, bounded metadata retry, online recovery, no grid reload on like, two toolbar buttons, external period label, removed resume');
 } finally {
   for (const route of blocked) await route.abort().catch(() => {});
   await context.close(); await browser.close();

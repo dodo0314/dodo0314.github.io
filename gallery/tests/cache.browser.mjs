@@ -51,6 +51,7 @@ try {
   const first = await firstScreen();
   const firstGrid = hits.filter(path => path.startsWith('/api/grid/')).length;
   assert.ok(firstGrid > 0); assert.equal(await page.evaluate(() => location.hash),'');
+  assert.match(first,/목록 도착 \d+\.\d초/,'the display shows when the album list arrived');
   assert.equal((await context.cookies()).find(cookie => cookie.name === 'jian_view')?.httpOnly,true);
   hits.length = 0;
   await page.goto(local+'/?timing=1');

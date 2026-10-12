@@ -768,17 +768,22 @@
       const now = performance.now(), done = shown != null && cards.every(sharp);
       if (!done && now < 60000) { box.textContent = '첫 화면 ' + cards.length + '칸 측정 중…' + (shown == null ? '' : ' 다 뜸 ' + seconds(shown)); return; }
       clearInterval(timer);
-      const sources = {}, names = {stored:'저장 링크',item:'사진별 갱신',renewed:'목록 갱신',retry:'거절 뒤 갱신',cached:'갱신된 링크'};
+      const sources = {}, names = {stored:'저장 링크',renewed:'목록 갱신',retry:'거절 뒤 갱신',cached:'갱신된 링크'};
+      // Where the time went: when the album list arrived, and the longest a grid image waited on the server.
+      const list = performance.getEntriesByType('resource').find(entry => new URL(entry.name).pathname === '/api/album');
+      let serverWait = 0;
       for (const entry of performance.getEntriesByType('resource')) {
         if (!/^\/api\/(grid|preview)\//.test(new URL(entry.name).pathname)) continue;
         // Safari may not report transfer sizes, so a server send time older than this page also means the cache.
         const timing = name => entry.serverTiming?.find(item => item.name === name)?.description;
         const cached = (entry.transferSize === 0 && entry.decodedBodySize > 0) || Number(timing('sent')) < performance.timeOrigin - 5000;
         const source = cached ? '브라우저 캐시' : names[timing('link')] || '기타';
+        if (!cached) serverWait = Math.max(serverWait,entry.serverTiming?.find(item => item.name === 'total')?.duration || 0);
         sources[source] = (sources[source] || 0) + 1;
       }
       const failed = cards.filter(card => card.querySelector('.card-error')).length;
       box.textContent = '첫 화면 ' + cards.length + '칸 · 다 뜸 ' + (shown == null ? '60초 넘음' : seconds(shown)) + ' · 선명 ' + (done ? seconds(now) : '60초 넘음')
+        + (list ? ' · 목록 도착 ' + seconds(list.responseEnd) : '') + (serverWait ? ' · 사진 서버 최대 ' + seconds(serverWait) : '')
         + (failed ? ' · 실패 ' + failed : '') + ' · ' + Object.entries(sources).map(([name,count]) => name + ' ' + count).join(' · ') + ' (누르면 닫혀요)';
       console.info('[jian timing] ' + box.textContent);
     },100);

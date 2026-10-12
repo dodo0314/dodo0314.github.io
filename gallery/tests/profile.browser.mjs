@@ -22,16 +22,18 @@ try {
   for (const saveData of [false, true]) {
     const context = await browser.newContext({viewport:{width:390,height:844},deviceScaleFactor:3,isMobile:true,hasTouch:true,timezoneId:'Asia/Seoul'});
     await context.addInitScript(value => Object.defineProperty(navigator,'connection',{value:{saveData:value}}), saveData);
-    const page = await context.newPage(), errors = [], originals = [];
+    const page = await context.newPage(), errors = [], originals = [], previews = [];
     page.setDefaultTimeout(10000);
     page.on('pageerror', error => errors.push(error.message));
-    let failLarge = false;
+    let failLarge = false, failSmall = false;
     await page.route(base + '/**', async route => {
       const url = new URL(route.request().url());
       if (url.pathname === '/') return route.fulfill({contentType:'text/html',body:html});
-      if (url.pathname === '/api/album') return route.fulfill({json:{title:'지안의 순간들',total:60,counts:{photo:60,video:0},matched:60,items:failLarge ? items.map(item => ({...item,preview:item.preview + '?generation=failed',thumbnail:item.thumbnail + '&generation=failed'})) : items,offset:0,nextOffset:null,revision:'fixture'}});
+      if (url.pathname === '/api/album') return route.fulfill({json:{title:'지안의 순간들',total:60,counts:{photo:60,video:0},matched:60,items:failLarge || failSmall ? items.map(item => ({...item,preview:item.preview + '?generation='+(failSmall ? 'small-failed' : 'large-failed'),thumbnail:item.thumbnail + '&generation='+(failSmall ? 'small-failed' : 'large-failed')})) : items,offset:0,nextOffset:null,revision:'fixture'}});
       if (url.pathname.startsWith('/preview/')) {
+        previews.push(url.pathname + url.search);
         const small = url.searchParams.get('size') === 'thumb';
+        if (failSmall && small) return route.fulfill({status:503,body:'Unavailable thumbnail'});
         if (failLarge && !small) return route.fulfill({status:503,body:'Unavailable preview'});
         return route.fulfill({contentType:'image/svg+xml',body:svg(small ? 176 : 800, Number(url.pathname.split('/').at(-1)))});
       }
@@ -44,7 +46,8 @@ try {
     await page.goto(base);
     await page.waitForFunction(() => document.querySelectorAll('.card img').length === 60 && [...document.querySelectorAll('.card img')].slice(0,3).every(img => img.complete && img.naturalWidth));
     assert.equal(originals.length,0, 'the grid must never download originals');
-    assert.equal(await page.locator('.card img').first().evaluate(img => img.naturalWidth),saveData ? 176 : 800);
+    assert.equal(await page.locator('.card img').first().evaluate(img => img.naturalWidth),176);
+    assert.ok(previews.every(url => new URL(url,base).searchParams.get('size') === 'thumb'),'the grid should request small thumbnails, rather than large previews');
     // These assertions run in the click task itself, before any fresh image request can complete.
     const immediate = await page.evaluate(() => {
       const thumb = document.querySelector('.card img').currentSrc;
@@ -86,7 +89,12 @@ try {
       await page.locator('.card').nth(4).click();
       assert.equal(await page.locator('#photo').evaluate(img => img.getAnimations().length),0);
       await page.locator('#home').click();
-      failLarge = true;
+      await page.evaluate(() => scrollTo(0,0));
+      failSmall = true;
+      await page.locator('#refresh').click();
+      await page.waitForFunction(() => document.querySelector('.card img')?.naturalWidth === 800);
+      assert.equal(await page.locator('.card-error').count(),0,'small thumbnail failure falls back to a large preview');
+      failSmall = false; failLarge = true;
       await page.locator('#refresh').click();
       await page.waitForFunction(() => document.querySelector('.card img')?.naturalWidth === 176);
       assert.equal(await page.locator('.card-error').count(),0,'large preview failure falls back to the smaller thumbnail');
@@ -99,5 +107,5 @@ try {
     assert.deepEqual(errors,[]);
     await context.close();
   }
-  console.log('PASS home returns to the last viewed card after navigation, 3-column grid at 320/390/820/1440px, every period, instant decoded-image reuse, progressive original, skipped-download cancellation, reduced motion, data saving, thumbnail fallback');
+  console.log('PASS small thumbnails in the grid, home returns to the last viewed card, 3-column grid at 320/390/820/1440px, every period, instant decoded-image reuse, progressive original, skipped-download cancellation, reduced motion, data saving, thumbnail fallback');
 } finally { await browser.close(); }

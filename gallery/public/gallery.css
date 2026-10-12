@@ -37,7 +37,7 @@ dialog[open]{display:grid;grid-template-rows:auto minmax(0,1fr) auto}
 dialog .viewer-top,dialog .stage,dialog .viewer-bottom{position:relative;inset:auto}
 dialog .stage{margin-inline:60px}
 .viewer-bottom{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px 20px}
-.original-actions{display:flex;gap:8px;align-items:center}
+.original-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:flex-end}
 .viewer-bottom #photo-name{max-width:100%}
 #action-status{grid-column:1/-1;font-size:12px;line-height:1.5;color:#c0ceca;margin:0}
 @media(max-width:520px){
@@ -46,7 +46,7 @@ dialog .stage{margin-inline:60px}
   #gallery{margin-inline:-16px;--gap:2px}.date-heading{padding-inline:16px;font-size:12px;margin-top:22px}.list-info{font-size:11px}.privacy-note{font-size:10px}
   .stage{inset:68px 0 118px}.nav{width:32px;height:48px;font-size:34px;background:#0d131630;border-radius:50%}.previous{left:4px}.next{right:4px}.viewer-top{height:68px;padding-right:8px;padding-left:12px}.viewer-tools{gap:0}.viewer-tools button{width:36px;font-size:21px}.viewer-bottom{padding-inline:16px;gap:12px}.viewer-bottom button{padding:10px;font-size:11px}.video-badge{bottom:6px;left:6px;font-size:10px;padding:4px 6px}.card-heart{top:7px;right:7px;font-size:16px}
 }
-@media(max-width:700px){.viewer-bottom{grid-template-columns:minmax(0,1fr)}.original-actions{flex-wrap:wrap}.viewer-bottom button{min-height:44px}.viewer-bottom #action-status{font-size:11px}}
+@media(max-width:700px){.viewer-bottom{grid-template-columns:minmax(0,1fr)}.original-actions{justify-content:flex-start}.viewer-bottom button{min-height:44px}.viewer-bottom #action-status{font-size:11px}}
 @media(max-width:520px){dialog .stage{margin-inline:0}}
 .skeleton-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:3px;margin-bottom:20px}.skeleton-grid span{aspect-ratio:1;background:var(--surface-soft);animation:breathe 1.4s ease-in-out infinite alternate}.status:has(.skeleton-grid){padding:0;min-height:0}.status:has(.skeleton-grid) h2{font-size:14px}.status:has(.skeleton-grid) p{font-size:12px}@keyframes breathe{to{opacity:.45}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}

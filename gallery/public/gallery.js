@@ -34,12 +34,89 @@
   }
   const heicCache = new Map(), temporaryURLs = new Set();
   let conversionController, conversionWorker, conversionTimer;
+  let shareFile = null, shareBusy = false, copyBusy = false, downloadVersion = 0, downloadFallback = false;
+  const supportsFileShare = () => typeof navigator.share === 'function' && typeof navigator.canShare === 'function';
+  const supportsImageCopy = () => typeof navigator.clipboard?.write === 'function' && typeof ClipboardItem === 'function' && (!ClipboardItem.supports || ClipboardItem.supports('image/png'));
+  function actionStatus(text) { $('action-status').textContent = text; $('action-status').hidden = !text; }
+  function canShareOriginal() {
+    try { return !!shareFile && supportsFileShare() && navigator.canShare({files:[shareFile]}); } catch { return false; }
+  }
+  function updateActions() {
+    const photo = selected?.kind === 'photo', ready = canShareOriginal();
+    $('download').disabled = shareBusy || (!downloadFallback && !shareFile);
+    $('download').textContent = downloadFallback ? '파일 다운로드 ↓' : shareFile ? '다운로드 ↓' : '다운로드 준비 중…';
+    $('download').setAttribute('aria-label',downloadFallback ? '원본 파일 다운로드' : '원본 저장 앱 선택');
+    $('download').setAttribute('aria-busy',String(!downloadFallback && !shareFile));
+    $('share').disabled = !photo || !ready || shareBusy;
+    $('copy').disabled = !photo || !originalReady || !image.complete || !image.naturalWidth || !supportsImageCopy() || copyBusy;
+    $('copy-small').disabled = $('copy').disabled;
+    $('copy').textContent = !supportsImageCopy() ? '이미지 복사 미지원' : copyBusy ? '복사 중…' : '이미지 복사(PNG)';
+  }
+  function resetActions() {
+    shareFile = null; shareBusy = copyBusy = false; ++downloadVersion;
+    downloadFallback = selected?.kind !== 'photo' || !supportsFileShare();
+    $('share').textContent = '공유 ↗'; actionStatus(''); updateActions();
+  }
+  image.addEventListener('load',updateActions);
   const photoTimers = new Set();
   const thumbnailWaiters = new Map(), thumbnailActive = new Set();
+  const thumbnailUpgrades = new Map();
+  let thumbnailUpgradeTimer;
+  const inViewport = element => {
+    const bounds = element.getBoundingClientRect();
+    return bounds.bottom > 0 && bounds.top < innerHeight && bounds.right > 0 && bounds.left < innerWidth;
+  };
+  function cancelThumbnailUpgrade(element) {
+    const upgrade = thumbnailUpgrades.get(element); if (!upgrade) return;
+    const waiting = thumbnailWaiters.get(element);
+    if (waiting) { ++waiting.upgradeGeneration; waiting.upgradeState = 'pending'; }
+    clearTimeout(upgrade.timer); upgrade.image.onload = upgrade.image.onerror = null; upgrade.image.removeAttribute('src');
+    thumbnailUpgrades.delete(element);
+  }
+  function scheduleThumbnailUpgrades() {
+    clearTimeout(thumbnailUpgradeTimer);
+    if (!saveData && !document.hidden && !viewer.open) thumbnailUpgradeTimer = setTimeout(pumpThumbnailUpgrades,150);
+  }
+  function pumpThumbnailUpgrades() {
+    if (saveData || document.hidden || viewer.open || thumbnailUpgrades.size || thumbnailActive.size >= 3) return;
+    if ([...thumbnailWaiters].some(([element,waiting]) => waiting.status !== 'done' && waiting.status !== 'failed' && inViewport(element))) return;
+    for (const [element,waiting] of thumbnailWaiters) {
+      if (waiting.status !== 'done' || waiting.full || waiting.upgradeState === 'failed' || waiting.upgradeState === 'done' || !element.isConnected || !inViewport(element)) continue;
+      const targetPixels = Math.ceil(waiting.button.clientWidth * Math.min(devicePixelRatio || 1,3));
+      if (Math.min(element.naturalWidth,element.naturalHeight) >= targetPixels || !waiting.item.preview || waiting.item.preview === waiting.item.thumbnail) continue;
+      const large = new Image(); large.alt = ''; large.decoding = 'async'; large.fetchPriority = 'low';
+      const generation = ++waiting.upgradeGeneration;
+      waiting.upgradeState = 'loading';
+      const upgrade = {image:large,timer:null}; thumbnailUpgrades.set(element,upgrade);
+      const active = () => thumbnailUpgrades.get(element) === upgrade && waiting.upgradeGeneration === generation && element.isConnected;
+      const finish = state => {
+        clearTimeout(upgrade.timer); large.onload = large.onerror = null;
+        if (thumbnailUpgrades.get(element) === upgrade) thumbnailUpgrades.delete(element);
+        waiting.upgradeState = state;
+      };
+      large.onload = async () => {
+        try { await large.decode(); }
+        catch { if (active()) { finish('failed'); pumpThumbnails(); } return; }
+        if (!active()) return;
+        if (document.hidden || viewer.open || !inViewport(element)) { cancelThumbnailUpgrade(element); pumpThumbnails(); return; }
+        finish('done');
+        if (Math.min(large.naturalWidth,large.naturalHeight) > Math.min(element.naturalWidth,element.naturalHeight)) {
+          thumbnailObserver?.unobserve(element); thumbnailWaiters.delete(element);
+          waiting.full = true; waiting.src = waiting.item.preview;
+          element.replaceWith(large); thumbnailWaiters.set(large,waiting); thumbnailObserver?.observe(large);
+          rememberPreview(waiting.item.id,large);
+        }
+        pumpThumbnails();
+      };
+      large.onerror = () => { if (active()) { finish('failed'); large.removeAttribute('src'); pumpThumbnails(); } };
+      upgrade.timer = setTimeout(() => large.onerror?.(),15000);
+      large.src = waiting.item.preview; break;
+    }
+  }
   function pumpThumbnails() {
     if (document.hidden || viewer.open) return;
     for (const [element, waiting] of thumbnailWaiters) {
-      if (thumbnailActive.size >= 3) break;
+      if (thumbnailActive.size + thumbnailUpgrades.size >= 3) break;
       if (!waiting.eligible || waiting.status !== 'queued' || !element.isConnected) continue;
       element.hidden = false;
       waiting.status = 'loading'; thumbnailActive.add(element);
@@ -50,14 +127,16 @@
       element.onload = () => {
         if (waiting.generation !== generation) return;
         finish(); waiting.status = 'done'; waiting.button.querySelector('.card-error')?.remove();
+        waiting.full = waiting.src === waiting.item.preview;
         if (!saveData) rememberPreview(waiting.item.id,element);
         pumpThumbnails();
       };
       element.onerror = async () => {
         if (waiting.generation !== generation) return;
         finish(); element.removeAttribute('src');
-        if (waiting.src !== waiting.item.thumbnail && waiting.item.thumbnail && !waiting.smallTried) {
-          waiting.smallTried = true; waiting.src = waiting.item.thumbnail; waiting.status = 'queued'; pumpThumbnails(); return;
+        const fallback = waiting.item.preview;
+        if (fallback && fallback !== waiting.src && !waiting.fallbackTried) {
+          waiting.fallbackTried = true; waiting.src = fallback; waiting.status = 'queued'; pumpThumbnails(); return;
         }
         if (!waiting.refreshed && !document.hidden && !viewer.open) {
           waiting.refreshed = true; waiting.status = 'refreshing'; thumbnailActive.add(element);
@@ -65,9 +144,9 @@
           try {
             const item = await refreshItem(waiting.item.id,control.signal);
             if (waiting.generation !== generation || !element.isConnected) return;
-            waiting.item = item; waiting.src = saveData ? item.thumbnail : item.preview || item.thumbnail;
+            waiting.item = item; waiting.src = item.thumbnail || item.preview;
             const url = new URL(waiting.src,location.href); url.searchParams.set('fresh','1'); waiting.src = url.href;
-            waiting.smallTried = false; waiting.status = 'queued';
+            waiting.fallbackTried = false; waiting.status = 'queued';
           } catch { if (waiting.generation === generation) waiting.status = 'failed'; }
           finally { if (waiting.generation === generation) { thumbnailActive.delete(element); waiting.control = null; } }
         } else waiting.status = 'failed';
@@ -80,12 +159,13 @@
       };
       waiting.timer = setTimeout(() => element.onerror?.(),25000); element.src = waiting.src;
     }
+    scheduleThumbnailUpgrades();
   }
   const thumbnailObserver = 'IntersectionObserver' in window ? new IntersectionObserver(entries => {
     for (const entry of entries) {
       const waiting = thumbnailWaiters.get(entry.target); if (!waiting) continue;
       waiting.eligible = entry.isIntersecting;
-      if (!entry.isIntersecting) pauseThumbnail(entry.target);
+      if (!entry.isIntersecting) { pauseThumbnail(entry.target); cancelThumbnailUpgrade(entry.target); }
     }
     pumpThumbnails();
   }, {rootMargin:'180px'}) : null;
@@ -97,9 +177,12 @@
     thumbnailActive.delete(element);
   }
   function pauseThumbnails() {
+    clearTimeout(thumbnailUpgradeTimer);
+    for (const element of thumbnailUpgrades.keys()) cancelThumbnailUpgrade(element);
     for (const element of thumbnailActive) pauseThumbnail(element);
   }
   function stopThumbnailTimer(element) {
+    cancelThumbnailUpgrade(element);
     const waiting = thumbnailWaiters.get(element);
     if (waiting) { ++waiting.generation; clearTimeout(waiting.timer); waiting.control?.abort(); }
     element.onload = element.onerror = null; if (waiting?.status !== 'done') element.removeAttribute('src');
@@ -109,10 +192,14 @@
     for (const [element, waiting] of thumbnailWaiters) {
       const rect = element.getBoundingClientRect();
       waiting.eligible = rect.bottom > -180 && rect.top < innerHeight + 180;
-      if (waiting.status === 'failed') { waiting.status = 'queued'; waiting.refreshed = false; waiting.smallTried = false; waiting.src = saveData ? waiting.item.thumbnail : waiting.item.preview || waiting.item.thumbnail; }
+      if (waiting.status === 'failed') { waiting.status = 'queued'; waiting.refreshed = false; waiting.fallbackTried = false; waiting.src = waiting.item.thumbnail || waiting.item.preview; }
     }
     pumpThumbnails();
   }
+  for (const event of ['scroll','resize']) window.addEventListener(event,() => {
+    for (const element of thumbnailUpgrades.keys()) cancelThumbnailUpgrade(element);
+    scheduleThumbnailUpgrades();
+  },{passive:true});
   async function fetchJSON(url, init = {}, milliseconds = 15000) {
     const control = new AbortController(), abort = () => control.abort();
     if (init.signal?.aborted) control.abort(); else init.signal?.addEventListener('abort',abort,{once:true});
@@ -162,7 +249,7 @@
       const thumbnail = document.createElement('img'); thumbnail.alt = ''; thumbnail.decoding = 'async';
       if (index < 3) thumbnail.fetchPriority = 'high';
       button.append(thumbnail);
-      thumbnailWaiters.set(thumbnail,{item,button,src:saveData ? item.thumbnail : item.preview || item.thumbnail,status:'queued',generation:0,eligible:!thumbnailObserver});
+      thumbnailWaiters.set(thumbnail,{item,button,src:item.thumbnail || item.preview,status:'queued',generation:0,upgradeGeneration:0,upgradeState:'pending',full:false,eligible:!thumbnailObserver});
       thumbnailObserver?.observe(thumbnail);
     } else {
       const error = document.createElement('span'); error.className = 'card-error'; error.textContent = item.kind === 'video' ? '영상 보기' : '사진 열기'; button.append(error);
@@ -297,10 +384,10 @@
       const key = heicCache.keys().next().value; URL.revokeObjectURL(heicCache.get(key).url); heicCache.delete(key);
     }
   }
-  async function downloadHeic(url, signal) {
+  async function fetchOriginalBlob(url, signal, fallbackType = 'image/heic') {
     const target = new URL(url, location.href); target.searchParams.set('mode', 'bytes');
     const response = await fetch(target, { cache: 'no-store', signal });
-    if (!response.ok) throw new Error('download');
+    if (!response.ok) throw new Error(response.status === 413 ? 'too-large' : 'download');
     const reader = response.body.getReader(), chunks = []; let size = 0;
     try {
       while (true) {
@@ -311,7 +398,15 @@
       }
     } finally { reader.releaseLock(); }
     if (!size) throw new Error('download');
-    return new Blob(chunks, { type: response.headers.get('Content-Type') || 'image/heic' });
+    return new Blob(chunks, { type: response.headers.get('Content-Type') || fallbackType });
+  }
+  function prepareOriginal(item, blob) {
+    const file = new File([blob],item.name || 'original',{type:shareType(item,blob)});
+    shareFile = file; downloadFallback = !canShareOriginal(); updateActions();
+    if (downloadFallback) actionStatus('이 환경에서는 원본 앱 선택을 지원하지 않아요. 파일 다운로드로 저장해 주세요.');
+    if (blob.size > 24 * 1024 * 1024) return;
+    originalCache.delete(item.id); originalCache.set(item.id,{blob,file,savedAt:Date.now()});
+    while (originalCache.size > 6 || [...originalCache.values()].reduce((sum,value) => sum + value.blob.size,0) > 24 * 1024 * 1024) originalCache.delete(originalCache.keys().next().value);
   }
   async function convertHeic(blob, signal) {
     const buffer = await blob.arrayBuffer();
@@ -334,6 +429,7 @@
   async function show(index) {
     if (!viewer.open || index < 0 || index >= visible.length) return;
     cancelPhotoLoads(); resetVideo(); current = index; selected = visible[index];
+    resetActions();
     const item = selected, version = ++showVersion, isVideo = item.kind === 'video';
     $('photo-loading').hidden = isVideo; $('photo-loading').textContent = isVideo ? '영상을 불러오는 중…' : '사진을 불러오는 중…'; $('photo-error').hidden = true;
     image.removeAttribute('src'); image.alt = item.name; image.hidden = true;
@@ -358,14 +454,11 @@
       image.src = src; image.hidden = false; image.dataset.quality = full ? converted ? 'converted' : 'original' : 'preview'; $('photo-loading').hidden = true; $('photo-error').hidden = true;
       if (full) {
         originalReady = true; quality(converted ? '원본 해상도 · HEIC 변환' : '원본 화질', converted ? 'converted' : 'original');
-        if (!src.startsWith('blob:')) {
-          originalCache.delete(item.id); originalCache.set(item.id, {url:src, savedAt:Date.now()});
-          if (originalCache.size > 6) originalCache.delete(originalCache.keys().next().value);
-        }
+        warmNeighbors(index);
+        updateActions();
       } else quality(originalFailed ? originalFailureText : isHeic(item) ? '미리보기 · HEIC 원본 준비 중…' : '미리보기 · 원본 화질 불러오는 중…', 'preview');
       if (!displayed) {
         displayed = true;
-        warmNeighbors(index);
         if (!reducedMotion.matches) image.animate([{opacity:.75,transform:'scale(.97)'},{opacity:1,transform:'scale(1)'}], {duration:200,easing:'cubic-bezier(.2,.7,.2,1)'});
         if (index >= visible.length - 3 && page.nextOffset != null) more();
       }
@@ -382,63 +475,64 @@
     if (ready) display(ready.currentSrc || ready.src, false);
     const previewURL = item.preview || item.thumbnail;
     if (previewURL && (!ready || ready.src !== new URL(previewURL,location.href).href)) {
-      const preview = previewLoad = new Image(); preview.decoding = 'async';
+      const preview = previewLoad = new Image(); preview.decoding = 'async'; preview.fetchPriority = 'high';
       preview.onload = () => { rememberPreview(item.id,preview); display(preview.src, false); };
       preview.onerror = () => { previewFailed = true; failure(); }; timedPhoto(preview,previewURL,12000);
     } else if (!previewURL && !ready) previewFailed = true;
     const loadOriginal = () => {
       if (!active()) return;
       const full = originalLoad = new Image(); full.decoding = 'async'; full.fetchPriority = 'high';
-      if (isHeic(item)) {
-        const cached = heicCache.get(item.id);
-        if (cached) { full.onload = () => display(full.src, true, cached.converted); timedPhoto(full,cached.url,10000); return; }
-        const control = conversionController = new AbortController();
-        conversionTimer = setTimeout(() => control.abort(), 60000);
-        (async () => {
-          let phase = 'download';
-          try {
-            let blob;
-            try { blob = await downloadHeic(item.original, control.signal); }
+      const control = conversionController = new AbortController();
+      conversionTimer = setTimeout(() => control.abort(),60000);
+      (async () => {
+        let phase = 'download';
+        try {
+          const cached = originalCache.get(item.id);
+          let blob = cached && Date.now() - cached.savedAt < 5 * 60000 ? cached.blob : null;
+          if (!blob) {
+            try { blob = await fetchOriginalBlob(item.original,control.signal,'application/octet-stream'); }
             catch (error) {
               if (!active() || control.signal.aborted || error.message === 'too-large') throw error;
-              blob = await downloadHeic(await freshOriginal(item.id, control.signal), control.signal);
+              blob = await fetchOriginalBlob(await freshOriginal(item.id,control.signal),control.signal,'application/octet-stream');
             }
-            if (!active()) return;
-            const nativeURL = URL.createObjectURL(blob); temporaryURLs.add(nativeURL);
-            const supported = await new Promise(resolve => { full.onload = () => resolve(true); full.onerror = () => resolve(false); control.signal.addEventListener('abort', () => resolve(false), {once:true}); full.src = nativeURL; });
-            if (!active()) return;
-            if (control.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
-            if (supported) { rememberHeic(item.id, nativeURL, blob.size, false); display(nativeURL, true); return; }
-            URL.revokeObjectURL(nativeURL); temporaryURLs.delete(nativeURL);
-            phase = 'conversion'; quality(displayed ? '미리보기 · HEIC 원본 변환 중…' : 'HEIC 원본 변환 중…', 'loading');
-            const result = await convertHeic(blob, control.signal);
-            if (!active()) return;
-            const convertedURL = URL.createObjectURL(result.blob); temporaryURLs.add(convertedURL);
-            full.onload = () => { if (active()) { rememberHeic(item.id, convertedURL, result.blob.size, result.converted); display(convertedURL, true, result.converted); } };
-            full.onerror = () => { if (active()) { originalFailed = true; originalFailureText = '미리보기 · HEIC 변환을 완료하지 못했어요'; failure(); } };
-            timedPhoto(full,convertedURL,10000);
-          } catch (error) {
-            if (!active()) return;
-            originalFailed = true;
-            originalFailureText = error.message === 'too-large' ? '미리보기 · 큰 원본은 원본 열기로 확인해 주세요' : control.signal.aborted ? '미리보기 · 원본 준비 시간이 초과됐어요' : phase === 'download' ? '미리보기 · 원본 다운로드에 실패했어요' : '미리보기 · HEIC 변환을 완료하지 못했어요';
-            failure();
-          } finally { if (conversionController === control) { clearTimeout(conversionTimer); conversionController = null; } }
-        })();
-        return;
-      }
-      let retried = false;
-      full.onload = () => display(full.src, true);
-      full.onerror = async () => {
-        if (!active()) return;
-        if (!retried) {
-          retried = true;
-          try { const url = await freshOriginal(item.id); if (active()) { timedPhoto(full,url); return; } } catch {}
-        }
-        if (!active()) return;
-        originalFailed = true; failure();
-      };
-      const cached = originalCache.get(item.id);
-      timedPhoto(full,cached && Date.now() - cached.savedAt < 30 * 60000 ? cached.url : item.original);
+          }
+          if (!active()) return;
+          if (control.signal.aborted) throw new DOMException('Cancelled','AbortError');
+          prepareOriginal(item,blob);
+          const decoded = isHeic(item) ? heicCache.get(item.id) : null;
+          if (decoded) { full.onload = () => display(full.src,true,decoded.converted); timedPhoto(full,decoded.url,10000); return; }
+          phase = 'display';
+          const displayBlob = blob.type === 'application/octet-stream' ? new Blob([blob],{type:shareFile.type}) : blob;
+          const nativeURL = URL.createObjectURL(displayBlob); temporaryURLs.add(nativeURL);
+          const supported = await new Promise(resolve => {
+            const abort = () => resolve(false);
+            const finish = value => { control.signal.removeEventListener('abort',abort); resolve(value); };
+            full.onload = () => finish(true); full.onerror = () => finish(false);
+            control.signal.addEventListener('abort',abort,{once:true}); timedPhoto(full,nativeURL,10000);
+          });
+          if (!active()) return;
+          if (control.signal.aborted) throw new DOMException('Cancelled','AbortError');
+          if (supported) {
+            if (isHeic(item)) rememberHeic(item.id,nativeURL,blob.size,false);
+            display(nativeURL,true); return;
+          }
+          URL.revokeObjectURL(nativeURL); temporaryURLs.delete(nativeURL);
+          if (!isHeic(item)) throw new Error('display');
+          phase = 'conversion'; quality(displayed ? '미리보기 · HEIC 원본 변환 중…' : 'HEIC 원본 변환 중…','loading');
+          const result = await convertHeic(blob,control.signal);
+          if (!active()) return;
+          const convertedURL = URL.createObjectURL(result.blob); temporaryURLs.add(convertedURL);
+          full.onload = () => { if (active()) { rememberHeic(item.id,convertedURL,result.blob.size,result.converted); display(convertedURL,true,result.converted); } };
+          full.onerror = () => { if (active()) { originalFailed = true; originalFailureText = '미리보기 · HEIC 변환을 완료하지 못했어요'; failure(); } };
+          timedPhoto(full,convertedURL,10000);
+        } catch (error) {
+          if (!active()) return;
+          originalFailed = true;
+          originalFailureText = error.message === 'too-large' ? '미리보기 · 큰 원본은 파일 다운로드로 저장해 주세요' : control.signal.aborted ? '미리보기 · 원본 준비 시간이 초과됐어요' : phase === 'download' ? '미리보기 · 원본 다운로드에 실패했어요' : phase === 'conversion' ? '미리보기 · HEIC 변환을 완료하지 못했어요' : '미리보기 · 원본을 표시하지 못했어요';
+          if (!shareFile) { downloadFallback = true; updateActions(); actionStatus('원본을 미리 준비하지 못했어요. 파일 다운로드를 사용하거나 다시 시도해 주세요.'); }
+          failure();
+        } finally { if (conversionController === control) { clearTimeout(conversionTimer); conversionController = null; } }
+      })();
     };
     // Wait for the opening gesture to settle so swiping past a photo never starts its HEIC download.
     if (heicCache.has(item.id) || originalCache.has(item.id)) loadOriginal();
@@ -465,6 +559,111 @@
     try { const url = await freshOriginal(); if (tab) tab.location.href = url; else window.location.assign(url); }
     catch { if (tab) tab.close(); $('announcement').textContent = '원본을 열지 못했습니다. 목록을 새로고침해 주세요.'; }
   };
+  async function downloadFile() {
+    if (!selected) return;
+    const item = selected, version = ++downloadVersion;
+    $('download').disabled = true; actionStatus('원본 파일 다운로드를 준비하고 있어요.');
+    try {
+      const url = new URL(await freshOriginal(item.id),location.href);
+      if (version !== downloadVersion || !viewer.open) return;
+      url.searchParams.set('mode','download');
+      const link = document.createElement('a'); link.href = url.href; link.download = item.name || 'original';
+      viewer.append(link); link.click(); link.remove();
+      actionStatus('원본 다운로드를 요청했어요. 브라우저의 다운로드 목록이나 파일 앱에서 확인해 주세요.');
+    } catch {
+      if (version === downloadVersion) actionStatus('다운로드를 준비하지 못했어요. 다시 눌러 주세요.');
+    } finally { if (version === downloadVersion) updateActions(); }
+  }
+  function shareType(item, blob) {
+    const extension = item.name?.split('.').at(-1).toLowerCase();
+    const known = {heic:'image/heic',heif:'image/heif',jpg:'image/jpeg',jpeg:'image/jpeg',png:'image/png',gif:'image/gif',webp:'image/webp',avif:'image/avif',tif:'image/tiff',tiff:'image/tiff'};
+    return known[extension] || blob.type;
+  }
+  async function shareOriginal(intent = 'share') {
+    if (!viewer.open || !canShareOriginal() || shareBusy) return;
+    const version = showVersion, data = {files:[shareFile]};
+    shareBusy = true; updateActions();
+    try {
+      // No await or network request before share(): keep this tap's transient activation.
+      const result = navigator.share(data);
+      actionStatus(intent === 'save' ? '저장하려는 앱이나 ‘이미지 저장’·‘파일에 저장’을 선택해 주세요. 항목은 기기에 따라 달라요.' : '공유할 앱을 선택해 주세요.');
+      await result;
+      if (version === showVersion && viewer.open) actionStatus(intent === 'save' ? '선택한 앱에서 저장 결과를 확인해 주세요.' : '');
+    } catch (error) {
+      if (version !== showVersion || !viewer.open) return;
+      if (error.name === 'AbortError') actionStatus('');
+      else {
+        downloadFallback = true;
+        actionStatus('이 환경에서는 앱 선택창을 열지 못했어요. 파일 다운로드로 저장해 주세요.');
+      }
+    } finally { if (version === showVersion) { shareBusy = false; updateActions(); } }
+  }
+  $('download').onclick = () => downloadFallback ? downloadFile() : shareOriginal('save');
+  $('share').onclick = () => shareOriginal();
+  async function clipboardPNG(src, sourceWidth, sourceHeight, version, resources, maxSide) {
+    const active = () => version === showVersion && viewer.open && !resources.cancelled;
+    const source = resources.source = new Image(); source.decoding = 'sync'; source.src = src;
+    await source.decode();
+    if (!active()) throw new DOMException('Cancelled','AbortError');
+    if (source.naturalWidth !== sourceWidth || source.naturalHeight !== sourceHeight) throw new Error('image-changed');
+    const scale = Math.min(1,maxSide / Math.max(sourceWidth,sourceHeight));
+    const width = Math.max(1,Math.round(sourceWidth * scale)), height = Math.max(1,Math.round(sourceHeight * scale));
+    const canvas = resources.canvas = document.createElement('canvas'); canvas.width = width; canvas.height = height;
+    // Use an opaque sRGB backing store and flush sampled pixels before encoding.
+    const context = canvas.getContext('2d',{alpha:false,colorSpace:'srgb',willReadFrequently:true});
+    if (!context) throw new Error('canvas');
+    context.fillStyle = '#fff'; context.fillRect(0,0,width,height); context.drawImage(source,0,0,width,height);
+    const points = [[.1,.1],[.5,.5],[.9,.9],[.1,.9],[.9,.1]].map(([x,y]) => [Math.min(width-1,Math.floor(x*width)),Math.min(height-1,Math.floor(y*height))]);
+    const expected = points.map(([x,y]) => [...context.getImageData(x,y,1,1).data]);
+    const blob = await new Promise((resolve,reject) => canvas.toBlob(value => value ? resolve(value) : reject(new Error('encode')),'image/png'));
+    if (!active()) throw new DOMException('Cancelled','AbortError');
+    const bytes = new Uint8Array(await blob.slice(0,33).arrayBuffer());
+    if (blob.type !== 'image/png' || bytes.length !== 33 || [137,80,78,71,13,10,26,10].some((value,index) => bytes[index] !== value)) throw new Error('invalid-png');
+    const header = new DataView(bytes.buffer);
+    if (header.getUint32(16) !== width || header.getUint32(20) !== height) throw new Error('invalid-png');
+    const check = resources.check = new Image();
+    const url = resources.url = URL.createObjectURL(blob); check.src = url; await check.decode();
+    if (!active()) throw new DOMException('Cancelled','AbortError');
+    if (check.naturalWidth !== width || check.naturalHeight !== height) throw new Error('invalid-png');
+    const sample = resources.sample = document.createElement('canvas'); sample.width = sample.height = 1;
+    const sampling = sample.getContext('2d',{alpha:false,colorSpace:'srgb',willReadFrequently:true});
+    if (!sampling) throw new Error('canvas');
+    for (let index = 0; index < points.length; index++) {
+      const [x,y] = points[index]; sampling.drawImage(check,x,y,1,1,0,0,1,1);
+      const actual = sampling.getImageData(0,0,1,1).data;
+      if (expected[index].some((value,channel) => Math.abs(value-actual[channel]) > 3)) throw new Error('invalid-png');
+    }
+    // Retain the source canvas until clipboard.write() finishes; release the verification image now.
+    check.removeAttribute('src'); URL.revokeObjectURL(url); resources.url = null;
+    return blob;
+  }
+  async function copyImage(maxSide = Infinity) {
+    if (!viewer.open || !originalReady || !image.complete || !image.naturalWidth || copyBusy || !supportsImageCopy()) return;
+    const version = showVersion;
+    copyBusy = true; updateActions(); actionStatus('붙여넣기용 이미지를 복사하고 있어요.');
+    const resources = {};
+    let png;
+    try {
+      if (image.naturalWidth * image.naturalHeight > 50000000) throw new Error('too-large');
+      png = clipboardPNG(image.currentSrc || image.src,image.naturalWidth,image.naturalHeight,version,resources,maxSide);
+      // Safari needs clipboard.write() in the click task. Pass the future PNG as a Promise.
+      png.catch(() => {});
+      await navigator.clipboard.write([new ClipboardItem({'image/png':png},{presentationStyle:'inline'})]);
+      if (version === showVersion && viewer.open) actionStatus(maxSide === Infinity ? '검증한 PNG를 복사했어요. 원본 해상도를 유지하며 HEIC 형식·EXIF는 포함하지 않아요. 전송이 실패하면 메신저용 복사나 원본 공유를 사용해 주세요.' : '메신저용 PNG를 복사했어요. 긴 쪽은 최대 2048px이며 HEIC 형식·EXIF는 포함하지 않아요. 메신저에서 붙여넣어 주세요.');
+    } catch (error) {
+      if (version !== showVersion || !viewer.open) return;
+      actionStatus(error.message === 'too-large' ? '이 이미지는 복사하기에 너무 커요. 원본 공유를 사용해 주세요.' : '이 브라우저에서 이미지 복사를 완료하지 못했어요. 원본 공유를 사용해 주세요.');
+    } finally {
+      resources.cancelled = true;
+      await png?.catch(() => {});
+      resources.source?.removeAttribute('src'); resources.check?.removeAttribute('src');
+      if (resources.url) URL.revokeObjectURL(resources.url);
+      for (const canvas of [resources.canvas,resources.sample]) if (canvas) canvas.width = canvas.height = 1;
+      if (version === showVersion) { copyBusy = false; updateActions(); }
+    }
+  }
+  $('copy').onclick = () => copyImage();
+  $('copy-small').onclick = () => copyImage(2048);
   $('like').onclick = async () => {
     if (!selected) return;
     const id = selected.id, oldIndex = current;
@@ -497,7 +696,7 @@
   };
   viewer.addEventListener('cancel', () => video.pause());
   viewer.addEventListener('close', () => {
-    ++showVersion; cancelPhotoLoads(); resetVideo(); image.removeAttribute('src'); resumeThumbnails();
+    ++showVersion; cancelPhotoLoads(); resetActions(); resetVideo(); image.removeAttribute('src'); resumeThumbnails();
     const focus = lastFocused?.isConnected ? lastFocused : [...document.querySelectorAll('.card')].find(button => button.dataset.photoId === selected?.id) || $('all'); focus?.focus({preventScroll:true});
   });
   viewer.addEventListener('keydown', event => {

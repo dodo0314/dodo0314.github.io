@@ -375,6 +375,39 @@ test('an old migrated album renews originals through its supported listing when 
   assert.equal(second.status,303); assert.equal(scans,2,'reuse renewed snapshot instead of scanning on every selection');
 });
 
+test('original downloads preserve bytes and encode filenames without the viewer size limit', async () => {
+  for (const kind of ['photo','video']) {
+    const env = {...environment(),MS_CLIENT_ID:'download-'+kind};
+    const name = kind === 'photo' ? '지안 "원본"\r\n.heic' : '지안.mov';
+    const bytes = new Uint8Array([0,0,0,24,102,116,121,112,104,101,105,99]);
+    const type = kind === 'photo' ? 'image/heic' : 'video/quicktime';
+    let downloads = 0;
+    globalThis.fetch = async (input,init) => {
+      const url = String(input);
+      if (url.includes('/oauth2/v2.0/token')) return Response.json({access_token:'download-token',refresh_token:'download-refresh',expires_in:3600});
+      if (url.endsWith('/owner-album')) return Response.json({id:'owner-album'});
+      if (url.includes('children')) return Response.json({value:[{id:'media-one',name,file:{mimeType:type},'@microsoft.graph.downloadUrl':'https://photos.example/original'}]});
+      assert.equal(url,'https://photos.example/original'); downloads++;
+      assert.equal(init.headers?.Authorization,undefined); assert.equal(init.headers?.Cookie,undefined);
+      return new Response(bytes,{headers:{'Content-Type':type,'Content-Length':String(64*1024*1024)}});
+    };
+    const list = await (await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).json();
+    const res = await worker.fetch(new Request(env.PUBLIC_ORIGIN+list.items[0].original+'?mode=download',{headers:{Authorization:'visitor-secret',Cookie:'visitor-cookie'}}),env);
+    assert.equal(res.status,200); assert.equal(res.headers.has('Location'),false);
+    assert.equal(res.headers.get('Content-Type'),type);
+    assert.deepEqual(new Uint8Array(await res.arrayBuffer()),bytes);
+    const disposition = res.headers.get('Content-Disposition');
+    assert.match(disposition,/^attachment; filename="[^"\r\n]+"; filename\*=UTF-8''/);
+    assert.equal(decodeURIComponent(disposition.split("UTF-8''")[1]),name.replace(/[\r\n]/g,'_'));
+    assert.equal(downloads,1); assert.equal(res.headers.get('Cache-Control'),'private, no-store');
+    const forged = await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/original/forged?mode=download'),env);
+    assert.equal(forged.status,403); assert.equal(downloads,1);
+    await env.GALLERY_KV.delete('connection');
+    assert.notEqual((await worker.fetch(new Request(env.PUBLIC_ORIGIN+list.items[0].original+'?mode=download'),env)).status,200);
+    assert.equal(downloads,1);
+  }
+});
+
 test('expired photo bytes renew once for concurrent requests', async () => {
   const env = {...environment(),MS_CLIENT_ID:'expired-bytes-renewal'};
   let scans = 0, downloads = 0, startRefresh, finishRefresh;

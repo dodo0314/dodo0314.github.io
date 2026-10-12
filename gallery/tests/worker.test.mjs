@@ -725,7 +725,7 @@ test('old saved preview links are tried before renewal, and one refusal stops th
     const first = await worker.fetch(new Request(env.PUBLIC_ORIGIN+a.preview),old);
     assert.equal(first.status,200);
     if (!expired) {
-      assert.match(first.headers.get('Server-Timing'),/link;desc="stored"/);
+      assert.match(first.headers.get('Server-Timing'),/link;desc="stored", total;dur=\d+, sent;desc="\d{13}"/);
       assert.equal(reads.length,built,'a working saved link needs no album page read');
       continue;
     }

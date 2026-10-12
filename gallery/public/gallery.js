@@ -771,7 +771,10 @@
       const sources = {}, names = {stored:'저장 링크',renewed:'목록 갱신',retry:'거절 뒤 갱신',cached:'갱신된 링크'};
       for (const entry of performance.getEntriesByType('resource')) {
         if (!/^\/api\/(grid|preview)\//.test(new URL(entry.name).pathname)) continue;
-        const source = entry.transferSize === 0 && entry.decodedBodySize > 0 ? '브라우저 캐시' : names[entry.serverTiming?.find(item => item.name === 'link')?.description] || '기타';
+        // Safari may not report transfer sizes, so a server send time older than this page also means the cache.
+        const timing = name => entry.serverTiming?.find(item => item.name === name)?.description;
+        const cached = (entry.transferSize === 0 && entry.decodedBodySize > 0) || Number(timing('sent')) < performance.timeOrigin - 5000;
+        const source = cached ? '브라우저 캐시' : names[timing('link')] || '기타';
         sources[source] = (sources[source] || 0) + 1;
       }
       const failed = cards.filter(card => card.querySelector('.card-error')).length;

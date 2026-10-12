@@ -59,10 +59,20 @@ try {
   assert.ok(hits.includes('/api/album'),'the album list is always checked with the server');
   assert.deepEqual(secondGrid,[],'the next visit takes every first-screen grid image from the browser cache');
   assert.match(second,/브라우저 캐시 \d+/);
+  // Safari may not report transfer sizes; the server's send time must still reveal cached images.
+  await page.waitForTimeout(5500);
+  const safari = await context.newPage(); safari.on('pageerror',error => errors.push(error.message));
+  await safari.addInitScript(() => { for (const name of ['transferSize','decodedBodySize']) Object.defineProperty(PerformanceResourceTiming.prototype,name,{get:() => undefined}); });
+  hits.length = 0; await safari.goto(local+'/?timing=1');
+  await safari.waitForFunction(() => /선명 \d/.test(document.querySelector('#timing')?.textContent || ''),null,{timeout:20000});
+  const third = await safari.locator('#timing').textContent();
+  assert.deepEqual(hits.filter(path => path.startsWith('/api/grid/')),[]);
+  assert.equal(await safari.evaluate(() => performance.getEntriesByType('resource').find(entry => entry.name.includes('/api/grid/'))?.transferSize),undefined,'transfer sizes are hidden on this page');
+  assert.match(third,/브라우저 캐시 \d+/); assert.doesNotMatch(third,/저장 링크|갱신/);
   const stranger = await browser.newContext();
   const locked = await stranger.newPage(); await locked.goto(local+'/');
   await locked.waitForFunction(() => document.querySelector('#status h2')?.textContent === '초대받은 분만 볼 수 있어요');
   assert.equal(await locked.locator('.card').count(),0); await stranger.close();
   assert.deepEqual(errors,[]);
-  console.log('PASS browser cache: first visit '+firstGrid+' grid requests ('+first+'); next visit 0 grid requests ('+second+'); uninvited browser locked');
+  console.log('PASS browser cache: first visit '+firstGrid+' grid requests ('+first+'); next visit 0 grid requests ('+second+'); without transfer sizes ('+third+'); uninvited browser locked');
 } finally { await browser.close(); server.close(); }

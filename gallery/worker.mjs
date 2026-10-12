@@ -288,8 +288,9 @@ async function streamImage(target, preview = false, downloadName = null, extra =
         'Content-Type': remote.headers.get('Content-Type') || 'application/octet-stream',
         'Cache-Control': extra.cacheControl || (preview ? 'private, max-age=300' : 'private, no-store'),
         'Content-Disposition': downloadName === null ? 'inline' : attachment(downloadName),
-        // Lets the ?timing=1 page tell saved, renewed and cached links apart.
-        ...(extra.link ? { 'Server-Timing': `link;desc="${extra.link()}", total;dur=${Date.now() - extra.started}` } : {}),
+        // Lets the ?timing=1 page tell saved, renewed and cached links apart. The send time marks a
+        // response replayed from the browser cache in browsers that do not report transfer sizes.
+        ...(extra.link ? { 'Server-Timing': `link;desc="${extra.link()}", total;dur=${Date.now() - extra.started}, sent;desc="${Date.now()}"` } : {}),
       }) };
     });
     if (result.next) { url = result.next; continue; }

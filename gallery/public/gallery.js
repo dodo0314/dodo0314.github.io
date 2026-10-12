@@ -61,7 +61,10 @@
   const photoTimers = new Set();
   const thumbnailWaiters = new Map(), thumbnailActive = new Set();
   const thumbnailUpgrades = new Map();
-  let thumbnailUpgradeTimer;
+  // Small grid images share one connection (HTTP/2), so six in flight fill a phone screen sooner
+  // without saturating it; sharper replacements still run one at a time.
+  const THUMBNAIL_REQUESTS = 6;
+  let thumbnailUpgradeTimer, lastScrollAt = -Infinity;
   const inViewport = element => {
     const bounds = element.getBoundingClientRect();
     return bounds.bottom > 0 && bounds.top < innerHeight && bounds.right > 0 && bounds.left < innerWidth;
@@ -75,10 +78,11 @@
   }
   function scheduleThumbnailUpgrades() {
     clearTimeout(thumbnailUpgradeTimer);
-    if (!saveData && !document.hidden && !viewer.open) thumbnailUpgradeTimer = setTimeout(pumpThumbnailUpgrades,150);
+    // Start once scrolling has paused for 150ms; on a still screen the next upgrade follows at once.
+    if (!saveData && !document.hidden && !viewer.open) thumbnailUpgradeTimer = setTimeout(pumpThumbnailUpgrades,Math.max(0,150 - (performance.now() - lastScrollAt)));
   }
   function pumpThumbnailUpgrades() {
-    if (saveData || document.hidden || viewer.open || thumbnailUpgrades.size || thumbnailActive.size >= 3) return;
+    if (saveData || document.hidden || viewer.open || thumbnailUpgrades.size || thumbnailActive.size >= THUMBNAIL_REQUESTS) return;
     if ([...thumbnailWaiters].some(([element,waiting]) => waiting.status !== 'done' && waiting.status !== 'failed' && inViewport(element))) return;
     for (const [element,waiting] of thumbnailWaiters) {
       if (waiting.status !== 'done' || waiting.full || waiting.upgradeState === 'failed' || waiting.upgradeState === 'done' || !element.isConnected || !inViewport(element)) continue;
@@ -116,7 +120,7 @@
   function pumpThumbnails() {
     if (document.hidden || viewer.open) return;
     for (const [element, waiting] of thumbnailWaiters) {
-      if (thumbnailActive.size + thumbnailUpgrades.size >= 3) break;
+      if (thumbnailActive.size + thumbnailUpgrades.size >= THUMBNAIL_REQUESTS) break;
       if (!waiting.eligible || waiting.status !== 'queued' || !element.isConnected) continue;
       element.hidden = false;
       waiting.status = 'loading'; thumbnailActive.add(element);
@@ -197,6 +201,7 @@
     pumpThumbnails();
   }
   for (const event of ['scroll','resize']) window.addEventListener(event,() => {
+    lastScrollAt = performance.now();
     for (const element of thumbnailUpgrades.keys()) cancelThumbnailUpgrade(element);
     scheduleThumbnailUpgrades();
   },{passive:true});
@@ -294,7 +299,7 @@
     $('more-state').textContent = paging ? '다음 순간들을 불러오는 중…' : '';
     pumpThumbnails();
   }
-  function cacheKey() { return 'jian-page-v6:' + $('sort').value + ':' + $('media-type').value + ':' + (onlyFavorites ? [...favorites].sort().join(',') : 'all'); }
+  function cacheKey() { return 'jian-page-v7:' + $('sort').value + ':' + $('media-type').value + ':' + (onlyFavorites ? [...favorites].sort().join(',') : 'all'); }
   function cachedPage() {
     try { const cached = JSON.parse(sessionStorage.getItem(cacheKey()) || 'null'); return cached && Date.now() - cached.savedAt < 5 * 60000 ? cached.data : null; } catch { return null; }
   }
@@ -307,6 +312,14 @@
     const data = await fetchJSON('/api/album?' + query,init);
     if (!Array.isArray(data.items)) throw new Error('unavailable');
     return data;
+  }
+  let joinRefused = false;
+  function lockOut() {
+    for (const element of thumbnailWaiters.keys()) stopThumbnailTimer(element);
+    page = null; visible = []; $('gallery').replaceChildren();
+    $('more-area').hidden = $('list-info').hidden = $('retry').hidden = true;
+    try { sessionStorage.removeItem(cacheKey()); } catch {}
+    state('초대받은 분만 볼 수 있어요', joinRefused ? '초대 링크가 바뀌었거나 잘못 복사됐어요. 새 초대 링크를 받아 열어 주세요.' : '받은 초대 링크로 열어 주세요. 한 번 열면 이 브라우저에서는 다시 묻지 않아요.');
   }
   function accept(data) {
     page = data; baseOffset = data.offset || 0; visible = data.items;
@@ -329,6 +342,7 @@
       return true;
     } catch (error) {
       if (version !== loadVersion || error.name === 'AbortError') return false;
+      if (error.status === 401) { lockOut(); return false; }
       if (!visible.length) state('순간들을 잠시 불러올 수 없어요', '잠시 후 다시 시도해 주세요.');
       else if (focus) $('list-info').textContent = '이 순간은 현재 선택한 목록에서 찾지 못했어요. 전체 목록에서 다시 확인해 주세요.';
       else $('list-info').textContent = '목록을 갱신하지 못했어요. 지금 보이는 순간은 계속 감상할 수 있어요.';
@@ -729,5 +743,51 @@
   });
   window.addEventListener('online',recover);
   window.addEventListener('pageshow',event => { if (event.persisted) recover(); });
-  load(true);
+  // ?timing=1 shows how long the first screen of the grid takes and where its images came from.
+  function measureFirstScreen() {
+    const box = document.createElement('p'); box.id = 'timing'; box.setAttribute('role','status');
+    Object.assign(box.style,{position:'fixed',left:'8px',right:'8px',bottom:'8px',zIndex:'10',margin:'0',padding:'10px 12px',font:'13px/1.5 system-ui',background:'#13212ae6',color:'#fff',borderRadius:'6px'});
+    box.textContent = '첫 화면 측정 중…'; box.onclick = () => box.remove(); document.body.append(box);
+    const seconds = value => (value / 1000).toFixed(1) + '초';
+    const loaded = card => card.querySelector('.card-error') || card.querySelector('img')?.naturalWidth;
+    const sharp = card => {
+      const img = card.querySelector('img'), waiting = img && thumbnailWaiters.get(img);
+      if (!img || card.querySelector('.card-error')) return true;
+      if (!img.naturalWidth) return false;
+      return saveData || !waiting || waiting.full || waiting.upgradeState === 'failed' || waiting.item.preview === waiting.item.thumbnail
+        || Math.min(img.naturalWidth,img.naturalHeight) >= Math.ceil(card.clientWidth * Math.min(devicePixelRatio || 1,3));
+    };
+    let cards = null, shown = null;
+    const timer = setInterval(() => {
+      if (cards && !cards.every(card => card.isConnected)) cards = shown = null;
+      if (!cards) {
+        cards = [...document.querySelectorAll('#gallery .card')].filter(inViewport);
+        if (!cards.length) { cards = null; if (performance.now() > 60000) { clearInterval(timer); box.textContent = '60초 안에 사진 목록이 나오지 않았어요. (누르면 닫혀요)'; } return; }
+      }
+      if (shown == null && cards.every(loaded)) shown = performance.now();
+      const now = performance.now(), done = shown != null && cards.every(sharp);
+      if (!done && now < 60000) { box.textContent = '첫 화면 ' + cards.length + '칸 측정 중…' + (shown == null ? '' : ' 다 뜸 ' + seconds(shown)); return; }
+      clearInterval(timer);
+      const sources = {}, names = {stored:'저장 링크',renewed:'목록 갱신',retry:'거절 뒤 갱신',cached:'갱신된 링크'};
+      for (const entry of performance.getEntriesByType('resource')) {
+        if (!/^\/api\/(grid|preview)\//.test(new URL(entry.name).pathname)) continue;
+        const source = entry.transferSize === 0 && entry.decodedBodySize > 0 ? '브라우저 캐시' : names[entry.serverTiming?.find(item => item.name === 'link')?.description] || '기타';
+        sources[source] = (sources[source] || 0) + 1;
+      }
+      const failed = cards.filter(card => card.querySelector('.card-error')).length;
+      box.textContent = '첫 화면 ' + cards.length + '칸 · 다 뜸 ' + (shown == null ? '60초 넘음' : seconds(shown)) + ' · 선명 ' + (done ? seconds(now) : '60초 넘음')
+        + (failed ? ' · 실패 ' + failed : '') + ' · ' + Object.entries(sources).map(([name,count]) => name + ' ' + count).join(' · ') + ' (누르면 닫혀요)';
+      console.info('[jian timing] ' + box.textContent);
+    },100);
+  }
+  if (new URLSearchParams(location.search).has('timing')) measureFirstScreen();
+  // An invitation link carries its key after #k=. The fragment is never sent in a request,
+  // and it leaves the address bar before the key is checked.
+  const invitation = new URLSearchParams(location.hash.slice(1)).get('k');
+  if (invitation) {
+    history.replaceState(history.state,'',location.pathname + location.search);
+    state('초대를 확인하고 있어요','잠시만 기다려 주세요.',true);
+    fetchJSON('/api/join',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:invitation})})
+      .catch(error => { joinRefused = [400,403].includes(error.status); }).finally(() => load(true));
+  } else load(true);
 })();

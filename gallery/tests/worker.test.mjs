@@ -1,14 +1,31 @@
-import { test, afterEach } from 'node:test';
+import { test, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
-import worker, { sign, verify, isPhoto, readAlbum, albumPage, mediaDate } from '../worker.mjs';
+import gallery, { sign, verify, isPhoto, readAlbum, albumPage, mediaDate } from '../worker.mjs';
 
 const nativeFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = nativeFetch; });
+// Most tests visit as an invited person; the invitation gate has its own tests below.
+const viewerCookies = new Map();
+async function invited(request, env) {
+  if (!env?.VIEWER_KEY || !new URL(request.url).pathname.startsWith('/api/') || /(^|;\s*)jian_view=/.test(request.headers.get('Cookie') || '')) return request;
+  const id = env.ADMIN_PASSWORD + '\n' + env.VIEWER_KEY;
+  if (!viewerCookies.has(id)) {
+    const joined = await gallery.fetch(new Request(env.PUBLIC_ORIGIN + '/api/join', { method: 'POST',
+      headers: { Origin: env.PUBLIC_ORIGIN, 'Content-Type': 'application/json' }, body: JSON.stringify({ key: env.VIEWER_KEY }) }), env);
+    assert.equal(joined.status, 200);
+    viewerCookies.set(id, joined.headers.get('set-cookie').split(';')[0]);
+  }
+  const headers = new Headers(request.headers);
+  headers.set('Cookie', [request.headers.get('Cookie'), viewerCookies.get(id)].filter(Boolean).join('; '));
+  return new Request(request, { headers });
+}
+const worker = { fetch: async (request, env, ctx) => gallery.fetch(await invited(request, env), env, ctx) };
 function environment() {
   const storage = new Map([['connection', JSON.stringify({ refreshToken: 'test-refresh-token' })]]);
   return {
     PUBLIC_ORIGIN: 'https://jian.jahab.workers.dev', MS_CLIENT_ID: 'test-client', MS_CLIENT_SECRET: 'test-client-secret',
     ADMIN_PASSWORD: 'test-admin-password-at-least-20-characters', ALBUM_ITEM_ID: 'owner-album', ALBUM_TITLE: '지안의 순간들',
+    VIEWER_KEY: 'test-viewer-invitation-key-0123456789',
     GALLERY_KV: { async get(k, type) { const v = storage.get(k); return v == null ? null : type === 'json' ? JSON.parse(v) : v; },
       async put(k, v) { storage.set(k, v); }, async delete(k) { storage.delete(k); } },
   };
@@ -501,12 +518,13 @@ test('expired thumbnail and preview links renew together through their recorded 
     return url.includes('/expired-') ? new Response(null,{status:401}) : new Response('valid-jpeg-bytes',{headers:{'Content-Type':'image/jpeg'}});
   };
   const data = await (await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).json();
-  assert.ok(data.items[0].thumbnail.startsWith('/api/preview/'));
-  assert.ok(data.items[0].preview.startsWith('/api/preview/'));
+  assert.ok(data.items[0].thumbnail.startsWith('/api/grid/'));
+  assert.ok(data.items[0].preview.startsWith('/api/grid/'));
   for (const path of [data.items[0].thumbnail,data.items[0].preview]) {
     const response = await worker.fetch(new Request(env.PUBLIC_ORIGIN+path,{headers:{Cookie:'visitor-private'}}),env);
     assert.equal(response.status,200); assert.equal(await response.text(),'valid-jpeg-bytes');
-    assert.equal(response.headers.get('Cache-Control'),'private, max-age=300');
+    const maxAge = Number(/^private, max-age=(\d+)$/.exec(response.headers.get('Cache-Control'))?.[1]);
+    assert.ok(maxAge > 12 * 3600 - 60 && maxAge <= 24 * 3600,'grid images stay in the browser cache for 12–24 hours');
   }
   assert.equal(pageReads,2); assert.equal(bytes,3);
   assert.equal((await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/preview/forged'),env)).status,403);
@@ -527,9 +545,11 @@ test('legacy snapshots seek newer filenames, fall back for unsupported ordering 
         assert.ok(url.includes('$orderby=name%20desc'));
         if (!ordered) return new Response(null,{status:400});
       }
-      return Response.json({value:[{id:'photo-one',name:'20261010_104347967_iOS.heic',file:{mimeType:'image/heic'},thumbnails:[{large:{url:'https://photos.example/preview.jpg'}}]}],
+      // The saved list's link has expired, so the stored-link attempt is refused and renewal walks the album.
+      return Response.json({value:[{id:'photo-one',name:'20261010_104347967_iOS.heic',file:{mimeType:'image/heic'},thumbnails:[{large:{url:`https://photos.example/${pageReads === 1 ? 'expired' : 'preview'}.jpg`}}]}],
         ...(pageReads > 1 ? {'@odata.nextLink':'https://graph.microsoft.com/v1.0/me/drive/items/owner-album/children?unused=1'} : {})});
     }
+    if (url==='https://photos.example/expired.jpg') return new Response(null,{status:401});
     if (url==='https://photos.example/preview.jpg') return new Response('jpeg',{headers:{'Content-Type':'image/jpeg'}});
     throw Error('Do not enumerate unrelated later pages');
   };
@@ -568,21 +588,24 @@ test('preview streaming rejects non-images, arbitrary redirects and capabilities
 
 test('legacy album page hints survive cold Workers and never persist file URLs or grant another connection access', async () => {
   const env = {...environment(),MS_CLIENT_ID:'durable-legacy-hints'};
-  let pages = [];
+  let pages = [], saving = true;
   globalThis.fetch = async input => {
     const url = String(input);
     if (url.includes('/oauth2/v2.0/token')) return Response.json({access_token:'hints-token',refresh_token:'hints-refresh',expires_in:3600});
     if (url.endsWith('/owner-album')) return Response.json({id:'owner-album'});
     if (url.includes('children')) {
       const last = url.includes('page=3'); pages.push(url);
+      // Links saved with the list have expired; renewed pages return working ones.
       return Response.json({value:[{id:last ? 'photo-last' : 'photo-first',name:'one.heic',file:{mimeType:'image/heic'},
-        '@microsoft.graph.downloadUrl':'https://photos.example/private-original.heic',thumbnails:[{large:{url:'https://photos.example/private-preview.jpg'}}]}],
+        '@microsoft.graph.downloadUrl':'https://photos.example/private-original.heic',thumbnails:[{large:{url:`https://photos.example/${saving ? 'expired' : 'private'}-preview.jpg`}}]}],
         ...(!last ? {'@odata.nextLink':'https://graph.microsoft.com/v1.0/me/drive/items/owner-album/children?page=' + (url.includes('page=2') ? 3 : 2)} : {})});
     }
+    if (url.startsWith('https://photos.example/expired-')) return new Response(null,{status:401});
     if (url.startsWith('https://photos.example/')) return new Response('jpeg',{headers:{'Content-Type':'image/jpeg'}});
     throw Error('Unexpected hint fixture request');
   };
   const first = await (await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).json();
+  saving = false;
   const selected = first.items.find(item => item.id === 'photo-last');
   const cold = () => ({...env,GALLERY_KV:{...env.GALLERY_KV,async get(key,type) {
     const data = await env.GALLERY_KV.get(key,type);
@@ -595,7 +618,7 @@ test('legacy album page hints survive cold Workers and never persist file URLs o
   assert.equal((await worker.fetch(new Request(env.PUBLIC_ORIGIN+selected.preview),cold())).status,200);
   assert.equal(pages.length,1,'another cold Worker goes straight to the saved third page');
   assert.ok(pages[0].includes('page=3'));
-  const capability = await verify(selected.preview.split('/').at(-1),env,'media');
+  const capability = await verify(selected.preview.split('/').at(-1),env,'grid');
   const saved = await env.GALLERY_KV.get('page-hints:'+capability.scope+':'+capability.connectionId+':'+first.revision,'json');
   assert.ok(saved.pages.length >= 3);
   assert.equal(JSON.stringify(saved).includes('photos.example'),false,'only collection paths and album item IDs are persisted');
@@ -603,4 +626,142 @@ test('legacy album page hints survive cold Workers and never persist file URLs o
   pages = [];
   assert.equal((await worker.fetch(new Request(env.PUBLIC_ORIGIN+selected.preview),cold())).status,403);
   assert.equal(pages.length,0);
+});
+
+test('only invited browsers reach the album API, and changing VIEWER_KEY revokes them', async () => {
+  const env = {...environment(),MS_CLIENT_ID:'invitation-gate'}; mockGraph(1);
+  const page = await gallery.fetch(new Request(env.PUBLIC_ORIGIN+'/'),env);
+  assert.equal(page.status,200,'the page is public code; the album data is gated');
+  for (const path of ['/api/album','/api/item?id=photo-one','/api/grid/anything?size=thumb','/api/preview/anything','/api/original/anything']) {
+    const res = await gallery.fetch(new Request(env.PUBLIC_ORIGIN+path),env);
+    assert.equal(res.status,401,path); assert.match((await res.json()).error,/초대/);
+  }
+  const join = (key,origin = env.PUBLIC_ORIGIN,target = env) => gallery.fetch(new Request(env.PUBLIC_ORIGIN+'/api/join',{method:'POST',
+    headers:{Origin:origin,'Content-Type':'application/json'},body:JSON.stringify({key})}),target);
+  for (const [key,origin,status] of [['wrong-invitation-key-0123456789',env.PUBLIC_ORIGIN,403],[env.VIEWER_KEY,'https://attacker.example',403],['',env.PUBLIC_ORIGIN,400]]) {
+    const res = await join(key,origin);
+    assert.equal(res.status,status); assert.equal(res.headers.has('set-cookie'),false);
+  }
+  const joined = await join(env.VIEWER_KEY);
+  assert.equal(joined.status,200);
+  const setCookie = joined.headers.get('set-cookie');
+  assert.match(setCookie,/^jian_view=[^;]+; Path=\/; HttpOnly; Secure; SameSite=Lax; Max-Age=15552000$/);
+  assert.equal(setCookie.includes(env.VIEWER_KEY),false,'the cookie never contains the invitation key');
+  const cookie = setCookie.split(';')[0];
+  const album = await gallery.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album',{headers:{Cookie:cookie}}),env);
+  assert.equal(album.status,200); assert.equal(album.headers.has('set-cookie'),false,'a fresh cookie is not reissued');
+  const rotated = {...env,VIEWER_KEY:'a-new-invitation-key-after-rotation'};
+  assert.equal((await gallery.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album',{headers:{Cookie:cookie}}),rotated)).status,401);
+  const forged = await sign({kind:'viewer',key:'not-the-fingerprint',exp:Date.now()+60000},env);
+  assert.equal((await gallery.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album',{headers:{Cookie:'jian_view='+forged}}),env)).status,401);
+  const unset = {...env,VIEWER_KEY:undefined};
+  assert.equal((await gallery.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album',{headers:{Cookie:cookie}}),unset)).status,503,'without a key the gallery stays locked');
+  assert.equal((await join(env.VIEWER_KEY,env.PUBLIC_ORIGIN,unset)).status,503);
+});
+
+test('an invitation past half its life is renewed on the next visit', async () => {
+  const env = {...environment(),MS_CLIENT_ID:'invitation-renewal'}; mockGraph(1);
+  const joined = await gallery.fetch(new Request(env.PUBLIC_ORIGIN+'/api/join',{method:'POST',headers:{Origin:env.PUBLIC_ORIGIN},body:JSON.stringify({key:env.VIEWER_KEY})}),env);
+  const fingerprint = (await verify(joined.headers.get('set-cookie').split(';')[0].slice('jian_view='.length),env,'viewer')).key;
+  const aging = await sign({kind:'viewer',key:fingerprint,exp:Date.now()+30*86400000},env);
+  const res = await gallery.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album',{headers:{Cookie:'jian_view='+aging}}),env);
+  assert.equal(res.status,200); assert.match(res.headers.get('set-cookie'),/^jian_view=.+Max-Age=15552000$/);
+});
+
+test('the administrator page shows the invitation link only after login', async () => {
+  const env = environment();
+  assert.equal((await (await gallery.fetch(new Request(env.PUBLIC_ORIGIN+'/admin'),env)).text()).includes(env.VIEWER_KEY),false);
+  const session = await sign({kind:'admin',exp:Date.now()+60000},env);
+  const html = await (await gallery.fetch(new Request(env.PUBLIC_ORIGIN+'/admin',{headers:{Cookie:'jian_admin='+session}}),env)).text();
+  assert.ok(html.includes('https://jian.jahab.workers.dev/#k='+encodeURIComponent(env.VIEWER_KEY)));
+  const missing = await (await gallery.fetch(new Request(env.PUBLIC_ORIGIN+'/admin'),{...env,VIEWER_KEY:'short'})).text();
+  assert.match(missing,/VIEWER_KEY/);
+});
+
+test('grid links stay identical within a window, expire within a day and never open originals', async () => {
+  const env = {...environment(),MS_CLIENT_ID:'stable-grid-links'}; mockGraph(1);
+  const first = await (await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).json();
+  await new Promise(resolve => setTimeout(resolve,5));
+  const second = await (await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).json();
+  assert.equal(second.items[0].thumbnail,first.items[0].thumbnail,'the browser cache can reuse the thumbnail');
+  assert.equal(second.items[0].preview,first.items[0].preview);
+  const grid = first.items[0].preview.split('/').at(-1);
+  const data = await verify(grid,env,'grid');
+  const remaining = data.exp - Date.now();
+  assert.ok(remaining > 12 * 3600000 - 60000 && remaining <= 24 * 3600000);
+  assert.ok([4,16].includes(Number(new Date(data.exp).toLocaleString('en-US',{timeZone:'Asia/Seoul',hour:'numeric',hourCycle:'h23'}))),'windows turn over at 04:00 or 16:00 KST');
+  assert.equal(await verify(grid,env,'media'),null);
+  assert.equal((await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/original/'+grid),env)).status,403,'a grid link cannot download the original');
+  assert.equal((await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/original/'+grid+'?mode=download'),env)).status,403);
+  const media = first.items[0].original.split('/').at(-1);
+  assert.equal((await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/grid/'+media),env)).status,403);
+});
+
+test('old saved preview links are tried before renewal, and one refusal stops the attempts in that Worker', async () => {
+  for (const expired of [false,true]) {
+    const env = {...environment(),MS_CLIENT_ID:'stored-first-'+expired};
+    let phase = 'saved'; const reads = [], downloads = [];
+    globalThis.fetch = async input => {
+      const url = String(input);
+      if (url.includes('/oauth2/v2.0/token')) return Response.json({access_token:'stored-token',refresh_token:'stored-refresh',expires_in:3600});
+      if (url.endsWith('/owner-album')) return Response.json({id:'owner-album'});
+      if (url.includes('children')) {
+        reads.push(url); const second = url.includes('page=2'), id = second ? 'photo-b' : 'photo-a';
+        return Response.json({value:[{id,name:id+'.jpg',file:{mimeType:'image/jpeg'},photo:{takenDateTime:second ? '2026-01-02T00:00:00Z' : '2026-01-01T00:00:00Z'},
+          thumbnails:[{medium:{url:`https://photos.example/${phase}-${id}-thumb.jpg`},large:{url:`https://photos.example/${phase}-${id}.jpg`}}]}],
+          ...(second ? {} : {'@odata.nextLink':'https://graph.microsoft.com/v1.0/me/drive/items/owner-album/children?page=2'})});
+      }
+      downloads.push(url);
+      return expired && url.includes('/saved-') ? new Response(null,{status:401}) : new Response('jpeg',{headers:{'Content-Type':'image/jpeg'}});
+    };
+    const list = await (await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album?sort=old'),env)).json();
+    phase = 'renewed'; const built = reads.length;
+    // A list saved six hours ago: older than the 15 minutes after which links used to be renewed first.
+    const old = {...env,GALLERY_KV:{...env.GALLERY_KV,async get(key,type) {
+      const value = await env.GALLERY_KV.get(key,type);
+      return key.startsWith('album:') && type === 'json' && value ? {...value,updatedAt:new Date(Date.now()-6*3600000).toISOString()} : value;
+    }}};
+    const [a,b] = list.items;
+    const first = await worker.fetch(new Request(env.PUBLIC_ORIGIN+a.preview),old);
+    assert.equal(first.status,200);
+    if (!expired) {
+      assert.match(first.headers.get('Server-Timing'),/link;desc="stored"/);
+      assert.equal(reads.length,built,'a working saved link needs no album page read');
+      continue;
+    }
+    assert.match(first.headers.get('Server-Timing'),/link;desc="retry"/);
+    assert.equal(reads.length,built+1,'the refused link renews only its own page');
+    const second = await worker.fetch(new Request(env.PUBLIC_ORIGIN+b.preview),old);
+    assert.equal(second.status,200); assert.match(second.headers.get('Server-Timing'),/link;desc="renewed"/);
+    assert.equal(downloads.filter(url => url.includes('/saved-')).length,1,'after one refusal the other saved links are skipped');
+  }
+});
+
+test('a Worker keeps its parsed album list while a small revision key says it is current', async () => {
+  const env = {...environment(),MS_CLIENT_ID:'revision-key'}; mockGraph(1);
+  const get = env.GALLERY_KV.get; let fullReads = 0, revisionReads = 0;
+  env.GALLERY_KV.get = async (key,type) => {
+    if (key.startsWith('album:') && key.endsWith(':revision')) revisionReads++;
+    else if (key.startsWith('album:')) fullReads++;
+    return get(key,type);
+  };
+  mock.timers.enable({apis:['Date'],now:Date.now()});
+  try {
+    const first = await (await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).json();
+    fullReads = revisionReads = 0;
+    mock.timers.setTime(Date.now()+61000);
+    assert.equal((await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).status,200);
+    assert.equal(revisionReads,1); assert.equal(fullReads,0,'an unchanged list is not read and parsed again');
+    const albumKey = (await verify(first.items[0].original.split('/').at(-1),env,'media')).scope;
+    assert.equal(await get(albumKey+':revision'),first.revision);
+    await env.GALLERY_KV.put(albumKey+':revision','saved-by-another-worker');
+    mock.timers.setTime(Date.now()+61000);
+    assert.equal((await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env)).status,200);
+    assert.equal(fullReads,1,'a different revision reloads the list');
+    await env.GALLERY_KV.delete(albumKey+':revision');
+    mock.timers.setTime(Date.now()+61000);
+    await worker.fetch(new Request(env.PUBLIC_ORIGIN+'/api/album'),env);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(fullReads,2); assert.equal(await get(albumKey+':revision'),first.revision,'a list saved before this version gets its revision key');
+  } finally { mock.timers.reset(); }
 });
